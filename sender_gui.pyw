@@ -574,8 +574,35 @@ class App(tk.Tk):
                  bg=BG, fg="#888", font=("Segoe UI", 10)).pack(side="right",
                                                                padx=12)
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(expand=True)
+        # Scrollable body: some handhelds run this fullscreen window at a
+        # logical resolution shorter than the content needs (e.g. the ROG
+        # Ally X commonly runs at 150% display scaling, reporting a ~720px
+        # tall screen). A canvas + scrollbar keeps everything reachable
+        # instead of silently clipping the bottom of the layout.
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(outer, orient="vertical", width=28,
+                                 command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg=BG)
+        body_window = canvas.create_window((0, 0), window=body, anchor="n")
+
+        def _on_body_configure(_ev):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(ev):
+            canvas.coords(body_window, ev.width / 2, 0)
+
+        body.bind("<Configure>", _on_body_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(ev):
+            canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         tk.Label(body, bg=BG, fg="#9aa0a6", font=("Segoe UI", 12),
                  text="One-time: pair Bluetooth in Windows Settings, or "
@@ -636,14 +663,21 @@ class App(tk.Tk):
                                    font=("Consolas", 10), wraplength=980)
         self.lbl_detail.pack(pady=(0, 6))
 
-        self.view = ControllerView(body)
-        self.view.pack(pady=6)
+        # Controller diagram and touchpad sit side-by-side (not stacked) so
+        # everything fits on a handheld's short-but-wide fullscreen display.
+        views_row = tk.Frame(body, bg=BG)
+        views_row.pack(pady=6)
 
-        tk.Label(body, bg=BG, fg="#9aa0a6", font=("Segoe UI", 11),
+        self.view = ControllerView(views_row)
+        self.view.pack(side="left", padx=(0, 20))
+
+        pad_col = tk.Frame(views_row, bg=BG)
+        pad_col.pack(side="left", anchor="n")
+        tk.Label(pad_col, bg=BG, fg="#9aa0a6", font=("Segoe UI", 11),
                  text="Touchpad (drag to move the receiver PC's mouse "
-                      "cursor):").pack(pady=(6, 2))
-        pad_row = tk.Frame(body, bg=BG)
-        pad_row.pack(pady=(0, 6))
+                      "cursor):").pack(anchor="w", pady=(0, 4))
+        pad_row = tk.Frame(pad_col, bg=BG)
+        pad_row.pack()
         self.touchpad = TouchPad(pad_row, self.engine)
         self.touchpad.pack(side="left", padx=(0, 14))
         self.btn_touch_click = tk.Button(pad_row, text="⬤\nClick",
