@@ -21,7 +21,8 @@ from tkinter import ttk, messagebox
 
 APP_NAME = "WinPadBridge Receiver  (PC)"
 BT_CHANNELS = (4, 5, 6, 7)          # RFCOMM channels tried in order
-PACKET_FMT = "<IHBBhhhh"            # seq, buttons, LT, RT, LX, LY, RX, RY
+# seq, buttons, LT, RT, LX, LY, RX, RY, touch_flags, touch_x, touch_y
+PACKET_FMT = "<IHBBhhhhBHH"
 PACKET_SIZE = struct.calcsize(PACKET_FMT)
 HELLO = b"WINPADBRIDGE?"            # handshake: sender -> receiver
 WELCOME = b"WINPADBRIDGE!"          # handshake: receiver -> sender
@@ -32,25 +33,109 @@ BT_PROTO = getattr(socket, "BTPROTO_RFCOMM",
 DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"  # USB-cable discovery: handheld -> PC
 HERE_MSG = b"WINPADBRIDGE_HERE"          # USB-cable discovery: PC -> handheld
 CABLE_PORT = 47845
+TOUCH_W, TOUCH_H = 1920, 943        # DS4 touchpad native resolution
 
 # ---------------------------------------------------------------- vgamepad --
 VG_ERROR = ""
-GAMEPAD = None
+vg = None
+vc4 = None
 try:
     import vgamepad as vg
-    GAMEPAD = vg.VX360Gamepad()
+    import vgamepad.win.vigem_commons as vc4
 except Exception as e:
     VG_ERROR = str(e)
 
 _pad_lock = threading.Lock()
 
 
-def pad_apply(state):
-    if GAMEPAD is None:
-        return
-    buttons, lt, rt, lx, ly, rx, ry = state
-    with _pad_lock:
-        r = GAMEPAD.report
+def _axis_to_u8(v):
+    """XInput axis (-32768..32767) -> DS4 axis byte (0..255, 128=neutral)."""
+    return max(0, min(255, 128 + round((v / 32767.0) * 127)))
+
+
+class Pad:
+    """Wraps the virtual controller so its type can be switched at runtime
+    between Xbox 360 (broadest game compatibility, no touchpad) and DS4
+    (adds touchpad support, but some Xbox-only games won't see it)."""
+
+    _DPAD = None  # built lazily once vg is known to have loaded
+    _BTN_MAP = None
+
+    def __init__(self, pad_type="xbox360"):
+        self.type = pad_type
+        self.gp = None
+        self.error = VG_ERROR
+        self._touch_id = 0
+        self._touch_was_active = False
+        if vg is not None:
+            self._build_maps()
+            self._create()
+
+    @classmethod
+    def _build_maps(cls):
+        if cls._DPAD is not None:
+            return
+        D = vg.DS4_DPAD_DIRECTIONS
+        cls._DPAD = {
+            (0, 0): D.DS4_BUTTON_DPAD_NONE,
+            (1, 0): D.DS4_BUTTON_DPAD_NORTH,
+            (1, 1): D.DS4_BUTTON_DPAD_NORTHEAST,
+            (0, 1): D.DS4_BUTTON_DPAD_EAST,
+            (-1, 1): D.DS4_BUTTON_DPAD_SOUTHEAST,
+            (-1, 0): D.DS4_BUTTON_DPAD_SOUTH,
+            (-1, -1): D.DS4_BUTTON_DPAD_SOUTHWEST,
+            (0, -1): D.DS4_BUTTON_DPAD_WEST,
+            (1, -1): D.DS4_BUTTON_DPAD_NORTHWEST,
+        }
+        B = vg.DS4_BUTTONS
+        # (XInput button bit, matching DS4 button) -- physical face-button
+        # positions line up 1:1 between Xbox and PlayStation layouts.
+        cls._BTN_MAP = (
+            (0x1000, B.DS4_BUTTON_CROSS),           # A
+            (0x2000, B.DS4_BUTTON_CIRCLE),           # B
+            (0x4000, B.DS4_BUTTON_SQUARE),           # X
+            (0x8000, B.DS4_BUTTON_TRIANGLE),         # Y
+            (0x0100, B.DS4_BUTTON_SHOULDER_LEFT),    # LB
+            (0x0200, B.DS4_BUTTON_SHOULDER_RIGHT),   # RB
+            (0x0020, B.DS4_BUTTON_SHARE),            # BACK
+            (0x0010, B.DS4_BUTTON_OPTIONS),          # START
+            (0x0040, B.DS4_BUTTON_THUMB_LEFT),       # L3
+            (0x0080, B.DS4_BUTTON_THUMB_RIGHT),      # R3
+        )
+
+    def _create(self):
+        try:
+            self.gp = vg.VDS4Gamepad() if self.type == "ds4" else vg.VX360Gamepad()
+            self.error = ""
+        except Exception as e:
+            self.gp = None
+            self.error = str(e)
+
+    def set_type(self, pad_type):
+        if pad_type == self.type and self.gp is not None:
+            return
+        with _pad_lock:
+            self.type = pad_type
+            self._touch_id = 0
+            self._touch_was_active = False
+            self._create()
+
+    def apply(self, fields):
+        """fields = (buttons, lt, rt, lx, ly, rx, ry, touch_flags, touch_x, touch_y)"""
+        if self.gp is None:
+            return
+        with _pad_lock:
+            if self.type == "ds4":
+                self._apply_ds4(fields)
+            else:
+                self._apply_xbox360(fields)
+
+    def neutral(self):
+        self.apply((0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    def _apply_xbox360(self, fields):
+        buttons, lt, rt, lx, ly, rx, ry = fields[:7]
+        r = self.gp.report
         r.wButtons = buttons
         r.bLeftTrigger = lt
         r.bRightTrigger = rt
@@ -58,11 +143,62 @@ def pad_apply(state):
         r.sThumbLY = ly
         r.sThumbRX = rx
         r.sThumbRY = ry
-        GAMEPAD.update()
+        self.gp.update()
+
+    def _apply_ds4(self, fields):
+        buttons, lt, rt, lx, ly, rx, ry, touch_flags, touch_x, touch_y = fields
+        p = self.gp
+        p.reset()
+        for xinput_bit, ds4_btn in self._BTN_MAP:
+            if buttons & xinput_bit:
+                p.press_button(ds4_btn)
+        updown = (1 if buttons & 0x0001 else 0) - (1 if buttons & 0x0002 else 0)
+        leftright = (1 if buttons & 0x0008 else 0) - (1 if buttons & 0x0004 else 0)
+        p.directional_pad(self._DPAD[(updown, leftright)])
+        p.left_trigger(lt)
+        p.right_trigger(rt)
+        if lt > 10:
+            p.press_button(vg.DS4_BUTTONS.DS4_BUTTON_TRIGGER_LEFT)
+        if rt > 10:
+            p.press_button(vg.DS4_BUTTONS.DS4_BUTTON_TRIGGER_RIGHT)
+        # DS4's Y axis is inverted relative to XInput's (XInput: up = positive).
+        p.left_joystick(_axis_to_u8(lx), _axis_to_u8(-ly))
+        p.right_joystick(_axis_to_u8(rx), _axis_to_u8(-ry))
+
+        rep_ex = vc4.DS4_REPORT_EX()
+        sub = rep_ex.Report
+        sub.bThumbLX = p.report.bThumbLX
+        sub.bThumbLY = p.report.bThumbLY
+        sub.bThumbRX = p.report.bThumbRX
+        sub.bThumbRY = p.report.bThumbRY
+        sub.wButtons = p.report.wButtons
+        sub.bSpecial = p.report.bSpecial
+        sub.bTriggerL = p.report.bTriggerL
+        sub.bTriggerR = p.report.bTriggerR
+
+        touching = bool(touch_flags & 0x01)
+        click = bool(touch_flags & 0x02)
+        if touching and not self._touch_was_active:
+            self._touch_id = (self._touch_id + 1) & 0x7F
+        self._touch_was_active = touching
+        if click:
+            sub.bSpecial |= vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD
+
+        tx = max(0, min(TOUCH_W - 1, touch_x))
+        ty = max(0, min(TOUCH_H - 1, touch_y))
+        touch = sub.sCurrentTouch
+        touch.bIsUpTrackingNum1 = (0x00 if touching else 0x80) | self._touch_id
+        touch.bTouchData1[0] = tx & 0xFF
+        touch.bTouchData1[1] = ((ty & 0x0F) << 4) | ((tx >> 8) & 0x0F)
+        touch.bTouchData1[2] = (ty >> 4) & 0xFF
+        sub.bTouchPacketsN = 1
+        sub.sPreviousTouch[0].bIsUpTrackingNum1 = 0x80
+        sub.sPreviousTouch[1].bIsUpTrackingNum1 = 0x80
+
+        p.update_extended_report(rep_ex)
 
 
-def pad_neutral():
-    pad_apply((0, 0, 0, 0, 0, 0, 0))
+PAD = Pad("xbox360")
 
 
 def local_bt_mac():
@@ -88,7 +224,7 @@ class BtServer:
         self.stop_ev = threading.Event()
         self.status = "Bluetooth: starting..."
         self.link_active = False
-        self.latest = (0, 0, 0, 0, 0, 0, 0)
+        self.latest = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         self.pps = 0
         self.channel = None
         self.events = []
@@ -186,7 +322,7 @@ class BtServer:
                     last_data = time.monotonic()
                 except socket.timeout:
                     if time.monotonic() - last_data > 0.8:
-                        pad_neutral()               # stalled link safety
+                        PAD.neutral()               # stalled link safety
                 except OSError:
                     break
                 else:
@@ -200,7 +336,7 @@ class BtServer:
                             continue
                         _seq, *fields = struct.unpack(PACKET_FMT, pkt)
                         self.latest = tuple(fields)
-                        pad_apply(self.latest)
+                        PAD.apply(self.latest)
                         count += 1
 
                 now = time.monotonic()
@@ -214,8 +350,8 @@ class BtServer:
             except OSError:
                 pass
             self.link_active = False
-            self.latest = (0, 0, 0, 0, 0, 0, 0)
-            pad_neutral()
+            self.latest = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            PAD.neutral()
             self._log("Sender disconnected")
             self.status = (f"Listening on channel {self.channel} - waiting "
                            "for the sender...")
@@ -232,7 +368,7 @@ class CableServer:
         self.stop_ev = threading.Event()
         self.status = "USB cable: waiting for the sender..."
         self.link_active = False
-        self.latest = (0, 0, 0, 0, 0, 0, 0)
+        self.latest = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         self.pps = 0
         threading.Thread(target=self.run, daemon=True).start()
 
@@ -258,8 +394,8 @@ class CableServer:
             except socket.timeout:
                 if self.link_active:
                     self.link_active = False
-                    self.latest = (0, 0, 0, 0, 0, 0, 0)
-                    pad_neutral()
+                    self.latest = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    PAD.neutral()
                 data = None
             except OSError:
                 break
@@ -288,10 +424,10 @@ class CableServer:
             self.latest = tuple(fields)
             self.link_active = True
             self.status = f"USB cable: CONNECTED ({addr[0]})"
-            pad_apply(self.latest)
+            PAD.apply(self.latest)
 
         sock.close()
-        pad_neutral()
+        PAD.neutral()
 
 
 # --------------------------------------------------------- controller view --
@@ -417,7 +553,14 @@ cable"), not a plain charging cable. Once plugged in,
 Windows shows a new network adapter on both devices - no
 extra setup needed here, this app listens for it
 automatically. On the handheld, choose "USB cable" instead
-of Bluetooth and press START."""
+of Bluetooth and press START.
+
+TOUCHPAD (DS4 MODE)
+Switch "Pad type" to DS4 (Main tab, top) to get a touchpad
+in addition to the normal buttons/sticks - the sender shows
+a drag area plus a click button. Some games only recognize
+Xbox controllers and won't see a DS4 pad at all, so leave
+it on Xbox 360 unless you specifically need the touchpad."""
 
 
 class App(tk.Tk):
@@ -439,7 +582,7 @@ class App(tk.Tk):
         self.lbl_pad = tk.Label(f, font=("Segoe UI", 12, "bold"))
         self.lbl_pad.pack(anchor="w", padx=12, pady=(10, 2))
 
-        if GAMEPAD is None:
+        if PAD.gp is None:
             warn = tk.Frame(f, bg="#fff3cd", bd=1, relief="solid")
             warn.pack(fill="x", padx=12, pady=4)
             tk.Label(warn, bg="#fff3cd", justify="left", wraplength=430,
@@ -451,6 +594,18 @@ class App(tk.Tk):
             tk.Button(warn, text="Install vgamepad",
                       command=self._install_vgamepad).pack(side="right",
                                                            padx=8, pady=6)
+
+        prow = tk.Frame(f)
+        prow.pack(anchor="w", padx=12, pady=(0, 6))
+        tk.Label(prow, text="Pad type:").pack(side="left")
+        self.pad_type = tk.StringVar(value="xbox360")
+        for val, label in (("xbox360", "Xbox 360"), ("ds4", "DS4 (touchpad)")):
+            tk.Radiobutton(prow, text=label, variable=self.pad_type, value=val,
+                          command=self._on_pad_type_change)\
+                .pack(side="left", padx=(8, 0))
+        tk.Label(prow, fg="#888",
+                 text="  (DS4 adds the touchpad; some Xbox-only games won't "
+                      "recognize it)").pack(side="left")
 
         self.lbl_btid = tk.Label(f, font=("Consolas", 10), fg="#555")
         self.lbl_btid.pack(anchor="w", padx=12)
@@ -476,10 +631,13 @@ class App(tk.Tk):
         self.view = ControllerView(f)
         self.view.pack(padx=12, pady=6)
 
+        self.lbl_touch = tk.Label(f, font=("Consolas", 10), fg="#777")
+        self.lbl_touch.pack(anchor="w", padx=12)
+
         tk.Label(f, fg="#666", justify="left",
                  text="While this window is open, games see a normal "
-                      "Xbox 360 controller.\nExample (PCSX2): Settings > "
-                      "Controllers > Port 1 > Automatic Mapping.")\
+                      "Xbox 360 (or DS4) controller.\nExample (PCSX2): "
+                      "Settings > Controllers > Port 1 > Automatic Mapping.")\
             .pack(anchor="w", padx=12, pady=(0, 10))
 
         txt = tk.Text(self.tab_help, wrap="word", width=62, height=30,
@@ -526,13 +684,17 @@ class App(tk.Tk):
         self.cable.stop()
         self.cable = CableServer()
 
+    def _on_pad_type_change(self):
+        PAD.set_type(self.pad_type.get())
+
     def _tick(self):
-        if GAMEPAD is not None:
-            self.lbl_pad.config(text="Virtual Xbox 360 pad:  ACTIVE ✔",
+        if PAD.gp is not None:
+            label = "DS4" if PAD.type == "ds4" else "Xbox 360"
+            self.lbl_pad.config(text=f"Virtual {label} pad:  ACTIVE ✔",
                                 fg="#2e7d32")
         else:
-            self.lbl_pad.config(text="Virtual pad:  NOT ACTIVE "
-                                     "(monitor mode)", fg="#c62828")
+            self.lbl_pad.config(text=f"Virtual pad:  NOT ACTIVE "
+                                     f"({PAD.error[:60]})", fg="#c62828")
         bt = self.bt
         color = "#2e7d32" if bt.link_active else "#e65100"
         extra = f"   -   {bt.pps} packets/s" if bt.link_active else ""
@@ -545,12 +707,23 @@ class App(tk.Tk):
         self.lbl_cable.config(text=cab.status + cextra, fg=ccolor)
 
         if bt.link_active:
-            state, msg = bt.latest, "live over Bluetooth"
+            full, msg = bt.latest, "live over Bluetooth"
         elif cab.link_active:
-            state, msg = cab.latest, "live over USB cable"
+            full, msg = cab.latest, "live over USB cable"
         else:
-            state, msg = (0, 0, 0, 0, 0, 0, 0), "no data arriving"
-        self.view.show(state, msg)
+            full, msg = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0), "no data arriving"
+        self.view.show(full[:7], msg)
+
+        if PAD.type == "ds4":
+            touch_flags, touch_x, touch_y = full[7:10]
+            if touch_flags & 0x01:
+                click = "  CLICK" if touch_flags & 0x02 else ""
+                self.lbl_touch.config(text=f"Touch: {touch_x:>4},{touch_y:>3}"
+                                            f"{click}")
+            else:
+                self.lbl_touch.config(text="Touch: (not touching)")
+        else:
+            self.lbl_touch.config(text="")
         self.after(33, self._tick)
 
     def _close(self):

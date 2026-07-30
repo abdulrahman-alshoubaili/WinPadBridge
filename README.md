@@ -68,6 +68,26 @@ natively act as a Bluetooth gamepad peripheral.
 Both apps include a live controller-test view and step-by-step help
 built into the UI, so most setup issues are diagnosed on-screen.
 
+## Touchpad (DS4 mode)
+
+The receiver can emulate a **DS4 (PlayStation 4) controller** instead of
+an Xbox 360 pad. DS4 mode adds a touchpad — the sender shows a drag
+rectangle (mirrors the real DS4/DS5 touchpad's 1920x943 coordinate
+space) plus a separate click button, matching how a real touchpad
+reports finger position and physical click as distinct signals.
+
+This is opt-in and off by default: switch "Pad type" to **DS4** on the
+receiver's Main tab. Xbox 360 stays the default because some games only
+recognize Xbox-style controllers and won't see a DS4 pad at all — only
+switch to DS4 if you specifically need the touchpad (e.g. a PS-native
+port that uses it for a cursor or gestures). Buttons, sticks, and
+triggers work the same in both modes; only the touchpad requires DS4.
+
+Note: the touchpad implementation talks directly to ViGEmBus's extended
+DS4 report format and hasn't been validated against a wide range of
+real games — button/stick/dpad mapping has been verified in isolation,
+but touch behavior in-game may need tuning.
+
 ## Project background
 
 Built iteratively through real hands-on debugging: starting from a

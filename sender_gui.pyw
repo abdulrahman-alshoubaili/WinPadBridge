@@ -23,12 +23,14 @@ from tkinter import ttk, messagebox
 
 APP_NAME = "WinPadBridge Sender"
 BT_CHANNELS = (4, 5, 6, 7)              # RFCOMM channels tried in order
-PACKET_FMT = "<IHBBhhhh"                # seq, buttons, LT, RT, LX, LY, RX, RY
+# seq, buttons, LT, RT, LX, LY, RX, RY, touch_flags, touch_x, touch_y
+PACKET_FMT = "<IHBBhhhhBHH"
 HELLO = b"WINPADBRIDGE?"                # handshake: sender -> receiver
 WELCOME = b"WINPADBRIDGE!"              # handshake: receiver -> sender
 DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"  # USB-cable discovery: sender -> PC
 HERE_MSG = b"WINPADBRIDGE_HERE"          # USB-cable discovery: PC -> sender
 CABLE_PORT = 47845
+TOUCH_W, TOUCH_H = 1920, 943            # DS4 touchpad native resolution
 
 
 def discover_over_cable(timeout=2.5):
@@ -150,10 +152,29 @@ class PadEngine:
         self.latest = (0, 0, 0, 0, 0, 0, 0)
         self.error = ""
         self.changed = threading.Event()
+        # touchpad state, driven by the UI thread (see TouchPad widget)
+        self.touch_active = False
+        self.touch_x = 0
+        self.touch_y = 0
+        self.touch_click = False
         threading.Thread(target=self.run, daemon=True).start()
 
     def stop(self):
         self.stop_ev.set()
+
+    def set_touch(self, active, x, y):
+        self.touch_active = active
+        self.touch_x = x
+        self.touch_y = y
+        self.changed.set()
+
+    def set_touch_click(self, click):
+        self.touch_click = click
+        self.changed.set()
+
+    @property
+    def touch_flags(self):
+        return (1 if self.touch_active else 0) | (2 if self.touch_click else 0)
 
     def run(self):
         try:
@@ -301,8 +322,10 @@ class BtStreamer(threading.Thread):
                         now = time.monotonic()
                     last_sent = now
                     seq = (seq + 1) & 0xFFFFFFFF
-                    sock.sendall(struct.pack(PACKET_FMT, seq,
-                                             *self.engine.latest))
+                    e = self.engine
+                    sock.sendall(struct.pack(PACKET_FMT, seq, *e.latest,
+                                             e.touch_flags, e.touch_x,
+                                             e.touch_y))
                     count += 1
                     if now - t0 >= 1.0:
                         self.pps = count
@@ -357,9 +380,11 @@ class CableStreamer(threading.Thread):
                     now = time.monotonic()
                 last_sent = now
                 seq = (seq + 1) & 0xFFFFFFFF
+                e = self.engine
                 try:
-                    sock.sendto(struct.pack(PACKET_FMT, seq,
-                                            *self.engine.latest),
+                    sock.sendto(struct.pack(PACKET_FMT, seq, *e.latest,
+                                            e.touch_flags, e.touch_x,
+                                            e.touch_y),
                                (self.ip, CABLE_PORT))
                 except OSError as e:
                     self.status = f"USB cable send failed: {e}"
@@ -459,6 +484,43 @@ class ControllerView(tk.Canvas):
         self.itemconfig(self.i["msg"], text=msg)
 
 
+class TouchPad(tk.Canvas):
+    """A drag rectangle that mirrors a DS4/DS5 touchpad's coordinate space
+    (1920x943). Only has an effect when the receiver is set to DS4 mode --
+    in Xbox 360 mode the receiver just ignores this data."""
+
+    DISPLAY_W, DISPLAY_H = 460, 226   # keeps the real touchpad's aspect ratio
+
+    def __init__(self, master, engine):
+        super().__init__(master, width=self.DISPLAY_W, height=self.DISPLAY_H,
+                         bg="#1b1d22", highlightthickness=2,
+                         highlightbackground="#444")
+        self.engine = engine
+        self.hint = self.create_text(self.DISPLAY_W / 2, self.DISPLAY_H / 2,
+                                     text="touchpad - drag here", fill="#555",
+                                     font=("Segoe UI", 11))
+        self.dot = self.create_oval(0, 0, 0, 0, fill="", outline="")
+        self.bind("<ButtonPress-1>", self._touch)
+        self.bind("<B1-Motion>", self._touch)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _touch(self, ev):
+        x = max(0, min(self.DISPLAY_W, ev.x))
+        y = max(0, min(self.DISPLAY_H, ev.y))
+        tx = round(x / self.DISPLAY_W * (TOUCH_W - 1))
+        ty = round(y / self.DISPLAY_H * (TOUCH_H - 1))
+        self.engine.set_touch(True, tx, ty)
+        r = 9
+        self.coords(self.dot, x - r, y - r, x + r, y + r)
+        self.itemconfig(self.dot, fill="#43d167", outline="#2e7d32")
+        self.itemconfig(self.hint, text="")
+
+    def _release(self, _ev):
+        self.engine.set_touch(False, self.engine.touch_x, self.engine.touch_y)
+        self.itemconfig(self.dot, fill="", outline="")
+        self.itemconfig(self.hint, text="touchpad - drag here")
+
+
 # -------------------------------------------------------------------- app ---
 class App(tk.Tk):
     def __init__(self):
@@ -551,6 +613,24 @@ class App(tk.Tk):
 
         self.view = ControllerView(body)
         self.view.pack(pady=6)
+
+        tk.Label(body, bg=BG, fg="#9aa0a6", font=("Segoe UI", 11),
+                 text="Touchpad (only used when the receiver is set to "
+                      "DS4 mode):").pack(pady=(6, 2))
+        pad_row = tk.Frame(body, bg=BG)
+        pad_row.pack(pady=(0, 6))
+        self.touchpad = TouchPad(pad_row, self.engine)
+        self.touchpad.pack(side="left", padx=(0, 14))
+        self.btn_touch_click = tk.Button(pad_row, text="⬤\nClick",
+                                         font=("Segoe UI", 12, "bold"),
+                                         takefocus=0, bd=0, bg="#2b2f36",
+                                         fg=FG, activebackground="#3a4048",
+                                         activeforeground=FG)
+        self.btn_touch_click.bind(
+            "<ButtonPress-1>", lambda e: self.engine.set_touch_click(True))
+        self.btn_touch_click.bind(
+            "<ButtonRelease-1>", lambda e: self.engine.set_touch_click(False))
+        self.btn_touch_click.pack(side="left", ipadx=18, ipady=28)
 
         tk.Label(self, bg=BG, fg="#777", font=("Segoe UI", 10),
                  text="Keep this window open while playing on the "
