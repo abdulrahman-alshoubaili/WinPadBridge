@@ -1,16 +1,15 @@
-"""WinPadBridge Receiver (GUI) -- run this ON THE PC you want to control games on.
+"""WinPadBridge Receiver v0.5 -- run this ON THE PC you want to control games on.
 
-Double-click this file to open it. No terminal needed.
+Bluetooth only (plus optional USB cable). Double-click to open. No terminal,
+no firewall, no IPs.
 
-It creates a virtual Xbox 360 controller (via the ViGEmBus driver) and
-mirrors whatever the WinPadBridge Sender streams to it. Tabs:
-  * Home            - status, this PC's IP, start/stop listener
-  * Controller Test - live picture of what is arriving from the sender
-  * Help            - setup steps and troubleshooting
+Creates a virtual Xbox 360 controller (via the ViGEmBus driver) and
+mirrors whatever the WinPadBridge Sender streams over Bluetooth.
 """
 
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -21,12 +20,18 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "WinPadBridge Receiver  (PC)"
-DEFAULT_PORT = 47845
-PACKET_FMT = "<IHBBhhhh"          # seq, buttons, LT, RT, LX, LY, RX, RY
+BT_CHANNELS = (4, 5, 6, 7)          # RFCOMM channels tried in order
+PACKET_FMT = "<IHBBhhhh"            # seq, buttons, LT, RT, LX, LY, RX, RY
 PACKET_SIZE = struct.calcsize(PACKET_FMT)
-DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"
-HERE_MSG = b"WINPADBRIDGE_HERE"
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".winpadbridge_receiver.json")
+HELLO = b"WINPADBRIDGE?"            # handshake: sender -> receiver
+WELCOME = b"WINPADBRIDGE!"          # handshake: receiver -> sender
+NO_WINDOW = 0x08000000
+AF_BT = getattr(socket, "AF_BLUETOOTH", getattr(socket, "AF_BTH", None))
+BT_PROTO = getattr(socket, "BTPROTO_RFCOMM",
+                   getattr(socket, "BTHPROTO_RFCOMM", 3))
+DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"  # USB-cable discovery: handheld -> PC
+HERE_MSG = b"WINPADBRIDGE_HERE"          # USB-cable discovery: PC -> handheld
+CABLE_PORT = 47845
 
 # ---------------------------------------------------------------- vgamepad --
 VG_ERROR = ""
@@ -34,68 +39,202 @@ GAMEPAD = None
 try:
     import vgamepad as vg
     GAMEPAD = vg.VX360Gamepad()
-except Exception as e:                                   # driver/module missing
+except Exception as e:
     VG_ERROR = str(e)
+
+_pad_lock = threading.Lock()
 
 
 def pad_apply(state):
-    """Push a state tuple into the virtual pad (if available)."""
     if GAMEPAD is None:
         return
     buttons, lt, rt, lx, ly, rx, ry = state
-    r = GAMEPAD.report
-    r.wButtons = buttons
-    r.bLeftTrigger = lt
-    r.bRightTrigger = rt
-    r.sThumbLX = lx
-    r.sThumbLY = ly
-    r.sThumbRX = rx
-    r.sThumbRY = ry
-    GAMEPAD.update()
+    with _pad_lock:
+        r = GAMEPAD.report
+        r.wButtons = buttons
+        r.bLeftTrigger = lt
+        r.bRightTrigger = rt
+        r.sThumbLX = lx
+        r.sThumbLY = ly
+        r.sThumbRX = rx
+        r.sThumbRY = ry
+        GAMEPAD.update()
 
 
 def pad_neutral():
     pad_apply((0, 0, 0, 0, 0, 0, 0))
 
 
-# ------------------------------------------------------------------ helpers --
-def local_ips():
-    ips = set()
+def local_bt_mac():
+    """Best-effort read of this PC's Bluetooth adapter MAC address."""
+    ps = ("Get-NetAdapter | Where-Object "
+          "{$_.InterfaceDescription -like '*Bluetooth*'} | "
+          "Select-Object -First 1 -ExpandProperty MacAddress")
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ips.add(s.getsockname()[0])
-        s.close()
-    except OSError:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=NO_WINDOW)
+        mac = (r.stdout or "").strip().replace("-", ":").lower()
+        if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+            return mac
+    except Exception:
         pass
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            ips.add(ip)
-    except OSError:
-        pass
-    return sorted(ip for ip in ips if not ip.startswith("127."))
+    return "unknown"
 
 
-def is_newer(seq, last):
-    if last is None:
-        return True
-    return seq != last and ((seq - last) & 0xFFFFFFFF) < 0x80000000
-
-
-# ---------------------------------------------------------------- engine ----
-class Engine:
-    """Background thread: listens on UDP, feeds the virtual pad."""
-
-    def __init__(self, port):
-        self.port = port
+# -------------------------------------------------------- Bluetooth server --
+class BtServer:
+    def __init__(self):
         self.stop_ev = threading.Event()
-        self.latest = (0, 0, 0, 0, 0, 0, 0)
+        self.status = "Bluetooth: starting..."
         self.link_active = False
-        self.sender_ip = ""
+        self.latest = (0, 0, 0, 0, 0, 0, 0)
         self.pps = 0
-        self.error = ""
-        self.thread = threading.Thread(target=self.run, daemon=True)
-        self.thread.start()
+        self.channel = None
+        self.events = []
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def _log(self, msg):
+        self.events = (self.events + [time.strftime("%H:%M:%S ") + msg])[-6:]
+
+    def stop(self):
+        self.stop_ev.set()
+
+    def run(self):
+        if AF_BT is None:
+            self.status = ("Bluetooth is not supported by this Python "
+                           "build. Install Python 3.11+ from python.org.")
+            return
+        srv = None
+        last_err = ""
+        any_addr = getattr(socket, "BDADDR_ANY", "00:00:00:00:00:00")
+        for ch in BT_CHANNELS:
+            try:
+                s = socket.socket(AF_BT, socket.SOCK_STREAM,
+                                  BT_PROTO)
+                s.bind((any_addr, ch))
+                s.listen(1)
+                srv = s
+                self.channel = ch
+                break
+            except OSError as ex:
+                last_err = str(ex)
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        if srv is None:
+            self.status = ("Bluetooth could not start. Turn Bluetooth ON "
+                           "in Windows Settings, then press 'Restart "
+                           f"Bluetooth'.  ({last_err[:70]})")
+            self._log("Failed to start: " + last_err[:70])
+            return
+
+        srv.settimeout(1.0)
+        self.status = (f"Listening on channel {self.channel} - waiting "
+                       "for the sender...")
+        self._log(f"Listening on Bluetooth channel {self.channel}")
+
+        while not self.stop_ev.is_set():
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            peer = addr[0] if isinstance(addr, tuple) else str(addr)
+            # Handshake: only accept a real WinPadBridge Sender.
+            try:
+                conn.settimeout(3)
+                greet = b""
+                while len(greet) < len(HELLO):
+                    part = conn.recv(len(HELLO) - len(greet))
+                    if not part:
+                        raise OSError("closed")
+                    greet += part
+                if greet != HELLO:
+                    raise OSError("not a WinPadBridge sender")
+                conn.sendall(WELCOME)
+            except OSError:
+                self._log(f"Rejected a non-WinPadBridge connection ({peer})")
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+
+            self._log(f"Sender connected ({peer})")
+            self.status = f"CONNECTED  ({peer})"
+            self.link_active = True
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            conn.settimeout(0.5)
+            buf = b""
+            last_data = time.monotonic()
+            count = 0
+            t0 = time.monotonic()
+
+            while not self.stop_ev.is_set():
+                try:
+                    chunk = conn.recv(512)
+                    if not chunk:
+                        break                       # sender disconnected
+                    buf += chunk
+                    last_data = time.monotonic()
+                except socket.timeout:
+                    if time.monotonic() - last_data > 0.8:
+                        pad_neutral()               # stalled link safety
+                except OSError:
+                    break
+                else:
+                    while len(buf) >= PACKET_SIZE:
+                        pkt = buf[:PACKET_SIZE]
+                        buf = buf[PACKET_SIZE:]
+                        # if more full packets are already queued behind
+                        # this one, skip straight to the newest - never
+                        # play back a backlog in slow motion
+                        if len(buf) >= PACKET_SIZE:
+                            continue
+                        _seq, *fields = struct.unpack(PACKET_FMT, pkt)
+                        self.latest = tuple(fields)
+                        pad_apply(self.latest)
+                        count += 1
+
+                now = time.monotonic()
+                if now - t0 >= 1.0:
+                    self.pps = count
+                    count = 0
+                    t0 = now
+
+            try:
+                conn.close()
+            except OSError:
+                pass
+            self.link_active = False
+            self.latest = (0, 0, 0, 0, 0, 0, 0)
+            pad_neutral()
+            self._log("Sender disconnected")
+            self.status = (f"Listening on channel {self.channel} - waiting "
+                           "for the sender...")
+
+        srv.close()
+
+
+class CableServer:
+    """Listens for the sender over a USB data-link cable (it enumerates as a
+    normal network adapter). Uses UDP + answers discovery pings so the
+    sender can auto-find this PC's link-local IP."""
+
+    def __init__(self):
+        self.stop_ev = threading.Event()
+        self.status = "USB cable: waiting for the sender..."
+        self.link_active = False
+        self.latest = (0, 0, 0, 0, 0, 0, 0)
+        self.pps = 0
+        threading.Thread(target=self.run, daemon=True).start()
 
     def stop(self):
         self.stop_ev.set()
@@ -104,12 +243,11 @@ class Engine:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", self.port))
+            sock.bind(("0.0.0.0", CABLE_PORT))
         except OSError as e:
-            self.error = f"Cannot listen on port {self.port}: {e}"
+            self.status = f"USB cable: cannot listen on port {CABLE_PORT}: {e}"
             return
         sock.settimeout(0.5)
-
         last_seq = None
         count = 0
         t0 = time.monotonic()
@@ -121,7 +259,7 @@ class Engine:
                 if self.link_active:
                     self.link_active = False
                     self.latest = (0, 0, 0, 0, 0, 0, 0)
-                    pad_neutral()                # never leave buttons stuck
+                    pad_neutral()
                 data = None
             except OSError:
                 break
@@ -131,28 +269,25 @@ class Engine:
                 self.pps = count
                 count = 0
                 t0 = now
-
             if not data:
                 continue
-
-            if data == DISCOVER_MSG:             # "Find receiver PC" feature
+            if data == DISCOVER_MSG:
                 try:
                     sock.sendto(HERE_MSG, addr)
                 except OSError:
                     pass
                 continue
-
             if len(data) != PACKET_SIZE:
                 continue
 
             seq, *fields = struct.unpack(PACKET_FMT, data)
-            if not is_newer(seq, last_seq):
+            if last_seq is not None and seq == last_seq:
                 continue
             last_seq = seq
             count += 1
             self.latest = tuple(fields)
-            self.sender_ip = addr[0]
             self.link_active = True
+            self.status = f"USB cable: CONNECTED ({addr[0]})"
             pad_apply(self.latest)
 
         sock.close()
@@ -185,38 +320,32 @@ class ControllerView(tk.Canvas):
 
     def _build(self):
         c = self
-        # trigger bars
         c.create_rectangle(40, 20, 62, 100, outline="#777", width=2)
         self.i["LTf"] = c.create_rectangle(42, 98, 60, 98, fill="#4caf50", width=0)
         c.create_rectangle(478, 20, 500, 100, outline="#777", width=2)
         self.i["RTf"] = c.create_rectangle(480, 98, 498, 98, fill="#4caf50", width=0)
         c.create_text(51, 112, text="LT", fill="#999")
         c.create_text(489, 112, text="RT", fill="#999")
-        # bumpers / start / back
         self._rect("LB", 85, 25, 160, 52, "LB")
         self._rect("RB", 380, 25, 455, 52, "RB")
         self._rect("BACK", 210, 30, 255, 52, "BACK")
         self._rect("START", 285, 30, 335, 52, "START")
-        # sticks
         self.i["Lring"] = c.create_oval(90, 105, 180, 195, outline="#777", width=2)
         self.i["Ldot"] = c.create_oval(127, 142, 143, 158, fill="#4caf50", width=0)
         self.i["Rring"] = c.create_oval(360, 105, 450, 195, outline="#777", width=2)
         self.i["Rdot"] = c.create_oval(397, 142, 413, 158, fill="#4caf50", width=0)
-        c.create_text(135, 205, text="L stick (click = L3)", fill="#999")
-        c.create_text(405, 205, text="R stick (click = R3)", fill="#999")
-        # d-pad
+        c.create_text(135, 205, text="L stick", fill="#999")
+        c.create_text(405, 205, text="R stick", fill="#999")
         self._rect("DPAD_UP", 215, 118, 240, 143, "▲")
         self._rect("DPAD_DOWN", 215, 173, 240, 198, "▼")
         self._rect("DPAD_LEFT", 190, 145, 215, 170, "◀")
         self._rect("DPAD_RIGHT", 240, 145, 265, 170, "▶")
-        # ABXY
         for name, (cx, cy) in {"Y": (315, 122), "X": (289, 148),
                                "B": (341, 148), "A": (315, 174)}.items():
             self.i[name] = c.create_oval(cx - 13, cy - 13, cx + 13, cy + 13,
                                          outline="#777", width=2, fill="")
             c.create_text(cx, cy, text=name, fill="#ccc",
                           font=("Segoe UI", 9, "bold"))
-        # numeric readout
         self.i["txt"] = c.create_text(self.W / 2, 235, fill="#8bc34a",
                                       font=("Consolas", 10), text="")
         self.i["txt2"] = c.create_text(self.W / 2, 258, fill="#8bc34a",
@@ -232,18 +361,15 @@ class ControllerView(tk.Canvas):
             on = bool(buttons & mask)
             fill = PRESSED.get(name, "#e0a400") if on else ""
             self.itemconfig(self.i[name], fill=fill)
-        # stick clicks change the ring color
         self.itemconfig(self.i["Lring"],
                         outline="#e0a400" if buttons & BTN["L3"] else "#777")
         self.itemconfig(self.i["Rring"],
                         outline="#e0a400" if buttons & BTN["R3"] else "#777")
-        # stick dots
         for dot, cx, cy, vx, vy in (("Ldot", 135, 150, lx, ly),
                                     ("Rdot", 405, 150, rx, ry)):
             x = cx + (vx / 32768.0) * 34
             y = cy - (vy / 32768.0) * 34
             self.coords(self.i[dot], x - 8, y - 8, x + 8, y + 8)
-        # triggers
         self.coords(self.i["LTf"], 42, 98 - (lt / 255.0) * 76, 60, 98)
         self.coords(self.i["RTf"], 480, 98 - (rt / 255.0) * 76, 498, 98)
         self.itemconfig(self.i["txt"],
@@ -254,40 +380,44 @@ class ControllerView(tk.Canvas):
 
 
 # -------------------------------------------------------------------- app ---
-HELP_TEXT = f"""HOW TO SET UP (this PC / receiver side)
+HELP_TEXT = """SIMPLE STEPS
 
-1.  Install the ViGEmBus driver (one time only):
-    open  github.com/nefarius/ViGEmBus/releases
-    download  ViGEmBus_x64.exe  and run it.
+ONE TIME ONLY
+1. Install the ViGEmBus driver:
+   github.com/nefarius/ViGEmBus/releases -> ViGEmBus_x64.exe
+2. If a yellow warning shows here, click "Install vgamepad"
+   and then close and reopen this app.
+3. Pair the two devices: this PC's Settings > Bluetooth ON
+   (keep the page open). Handheld's Settings > Bluetooth >
+   Add device > pick this PC > accept the PIN on BOTH.
 
-2.  If a yellow warning shows on the Home tab, click
-    "Install vgamepad", wait, then close and reopen this app.
+EVERY TIME
+1. Open this app on this PC. It waits on Bluetooth.
+2. On the handheld: switch controls to GAMEPAD mode
+   (Command Center button, Armoury Crate, or your device's
+   equivalent > Control Mode > Gamepad).
+3. Open WinPadBridge Sender on the handheld > Scan > pick
+   this PC > START.
+4. This window turns green: CONNECTED. Then in your game or
+   emulator, e.g. PCSX2: Settings > Controllers > Controller
+   Port 1 > Automatic Mapping > pick the Xbox 360 controller.
 
-3.  The first time you press Start, Windows Firewall may ask
-    about Python. Click Allow and tick BOTH Private and Public
-    networks (hotspot networks often count as Public).
+IF CONNECTED BUT NOTHING MOVES
+The handheld is in Desktop/Mouse mode (its mouse moves when
+you touch the sticks). Fix it on the handheld: Command
+Center button (or equivalent) > Control Mode > GAMEPAD. The
+sender screen shows this in red and turns green when fixed.
 
-    If you never saw that popup and nothing arrives, run this
-    once in an admin terminal:
-    netsh advfirewall firewall add rule name="WinPadBridge" dir=in action=allow protocol=UDP localport={DEFAULT_PORT}
+No firewall setup is needed - Bluetooth is not affected
+by Windows Firewall.
 
-4.  On the go: turn on this PC's Mobile Hotspot
-    (Settings > Network & internet > Mobile hotspot) and
-    connect the handheld to it. Your IP is usually 192.168.137.1.
-
-READING THE STATUS
-*  "Waiting for sender"      = listening, nothing arriving yet.
-*  "Receiving from <ip>"     = packets are coming in. The
-   Controller Test tab shows them live.
-*  If packets arrive but games see nothing, the virtual pad is
-   not active - fix step 1 and 2 above.
-
-IN YOUR GAME OR EMULATOR
-Any title that reads an Xbox 360 controller will pick this up
-automatically. Some emulators need manual mapping, e.g. in PCSX2:
-Settings > Controllers > Controller Port 1 > Automatic Mapping
-and pick the Xbox 360 controller. Do this AFTER this app is
-running (the pad must exist before the game/emulator scans)."""
+USB CABLE - ALTERNATIVE METHOD
+Needs a USB-C DATA-LINK cable (a "PC-to-PC transfer
+cable"), not a plain charging cable. Once plugged in,
+Windows shows a new network adapter on both devices - no
+extra setup needed here, this app listens for it
+automatically. On the handheld, choose "USB cable" instead
+of Bluetooth and press START."""
 
 
 class App(tk.Tk):
@@ -295,104 +425,81 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP_NAME)
         self.resizable(False, False)
-        self.port = self._load_port()
-        self.engine = Engine(self.port)
+        self.bt = BtServer()
+        self.cable = CableServer()
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
-        self.tab_home = ttk.Frame(nb)
-        self.tab_test = ttk.Frame(nb)
+        self.tab_main = ttk.Frame(nb)
         self.tab_help = ttk.Frame(nb)
-        nb.add(self.tab_home, text="   Home   ")
-        nb.add(self.tab_test, text="   Controller Test   ")
+        nb.add(self.tab_main, text="   Main   ")
         nb.add(self.tab_help, text="   Help   ")
 
-        self._build_home()
-        self._build_test()
-        self._build_help()
-
-        self.protocol("WM_DELETE_WINDOW", self._close)
-        self.after(33, self._tick)
-
-    # ---------------- home tab
-    def _build_home(self):
-        f = self.tab_home
-        pad = {"padx": 12, "pady": 6}
-
-        self.lbl_pad = tk.Label(f, font=("Segoe UI", 11, "bold"))
-        self.lbl_pad.grid(row=0, column=0, columnspan=3, sticky="w", **pad)
+        f = self.tab_main
+        self.lbl_pad = tk.Label(f, font=("Segoe UI", 12, "bold"))
+        self.lbl_pad.pack(anchor="w", padx=12, pady=(10, 2))
 
         if GAMEPAD is None:
             warn = tk.Frame(f, bg="#fff3cd", bd=1, relief="solid")
-            warn.grid(row=1, column=0, columnspan=3, sticky="we", padx=12, pady=4)
-            tk.Label(warn, bg="#fff3cd", justify="left", wraplength=470,
-                     text=("vgamepad / ViGEmBus is not available, so games "
-                           "cannot see a controller yet (monitor mode only).\n"
-                           "1) Install the ViGEmBus driver (Help tab)   "
-                           "2) Click the button below, then reopen this app.\n"
-                           f"Details: {VG_ERROR[:120]}")
+            warn.pack(fill="x", padx=12, pady=4)
+            tk.Label(warn, bg="#fff3cd", justify="left", wraplength=430,
+                     text=("vgamepad / ViGEmBus missing - games cannot see "
+                           "a controller yet.\n1) Install ViGEmBus driver "
+                           "(Help tab)  2) Click Install, then reopen.\n"
+                           f"Details: {VG_ERROR[:110]}")
                      ).pack(side="left", padx=8, pady=6)
             tk.Button(warn, text="Install vgamepad",
                       command=self._install_vgamepad).pack(side="right",
                                                            padx=8, pady=6)
 
-        tk.Label(f, text="This PC's IP (type this on the handheld):",
-                 font=("Segoe UI", 10)).grid(row=2, column=0, sticky="w", **pad)
-        self.lbl_ips = tk.Label(f, font=("Consolas", 12, "bold"), fg="#1a73e8")
-        self.lbl_ips.grid(row=3, column=0, columnspan=2, sticky="w", padx=12)
-        tk.Button(f, text="Refresh", command=self._refresh_ips)\
-            .grid(row=3, column=2, sticky="e", padx=12)
-        tk.Label(f, fg="#666",
-                 text="Tip: with Mobile Hotspot it is usually 192.168.137.1")\
-            .grid(row=4, column=0, columnspan=3, sticky="w", padx=12)
+        self.lbl_btid = tk.Label(f, font=("Consolas", 10), fg="#555")
+        self.lbl_btid.pack(anchor="w", padx=12)
+        brow = tk.Frame(f)
+        brow.pack(fill="x", padx=12, pady=6)
+        self.lbl_bt = tk.Label(brow, font=("Segoe UI", 13, "bold"),
+                               justify="left", wraplength=420)
+        self.lbl_bt.pack(side="left")
+        tk.Button(brow, text="Restart Bluetooth",
+                  command=self._restart_bt).pack(side="right")
+        self.lbl_log = tk.Label(f, font=("Consolas", 9), fg="#777",
+                                justify="left")
+        self.lbl_log.pack(anchor="w", padx=12)
 
-        tk.Label(f, text="Listen port:").grid(row=5, column=0, sticky="w", **pad)
-        self.port_var = tk.StringVar(value=str(self.port))
-        tk.Entry(f, textvariable=self.port_var, width=8)\
-            .grid(row=5, column=1, sticky="w")
-        tk.Button(f, text="Restart listener", command=self._restart)\
-            .grid(row=5, column=2, sticky="e", padx=12)
+        crow = tk.Frame(f)
+        crow.pack(fill="x", padx=12, pady=(2, 6))
+        self.lbl_cable = tk.Label(crow, font=("Segoe UI", 13, "bold"),
+                                  justify="left", wraplength=420)
+        self.lbl_cable.pack(side="left")
+        tk.Button(crow, text="Restart USB cable",
+                  command=self._restart_cable).pack(side="right")
 
-        self.lbl_link = tk.Label(f, font=("Segoe UI", 12, "bold"))
-        self.lbl_link.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
-        self.lbl_err = tk.Label(f, fg="#c62828", wraplength=500, justify="left")
-        self.lbl_err.grid(row=7, column=0, columnspan=3, sticky="w", padx=12)
+        self.view = ControllerView(f)
+        self.view.pack(padx=12, pady=6)
 
-        self._refresh_ips()
+        tk.Label(f, fg="#666", justify="left",
+                 text="While this window is open, games see a normal "
+                      "Xbox 360 controller.\nExample (PCSX2): Settings > "
+                      "Controllers > Port 1 > Automatic Mapping.")\
+            .pack(anchor="w", padx=12, pady=(0, 10))
 
-    # ---------------- test tab
-    def _build_test(self):
-        tk.Label(self.tab_test, justify="left",
-                 text=("This shows what is ARRIVING from the sender, live.\n"
-                       "If it moves here, the network part works.")
-                 ).pack(anchor="w", padx=10, pady=6)
-        self.view = ControllerView(self.tab_test)
-        self.view.pack(padx=10, pady=4)
-
-    # ---------------- help tab
-    def _build_help(self):
-        txt = tk.Text(self.tab_help, wrap="word", width=66, height=24,
+        txt = tk.Text(self.tab_help, wrap="word", width=62, height=30,
                       font=("Consolas", 9))
         txt.insert("1.0", HELP_TEXT)
         txt.config(state="disabled")
         txt.pack(fill="both", expand=True, padx=8, pady=8)
 
-    # ---------------- actions
-    def _refresh_ips(self):
-        ips = local_ips()
-        self.lbl_ips.config(text="   ".join(ips) if ips else
-                            "No network found - connect to Wi-Fi / hotspot")
+        self.lbl_btid.config(text="This PC over Bluetooth:  reading...")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(200, self._late_init)
+        self.after(33, self._tick)
 
-    def _restart(self):
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            messagebox.showerror(APP_NAME, "Port must be a number.")
-            return
-        self.engine.stop()
-        self.port = port
-        self._save_port()
-        self.engine = Engine(port)
+    def _late_init(self):
+        def work():
+            mac = local_bt_mac()
+            name = socket.gethostname()
+            self.after(0, lambda: self.lbl_btid.config(
+                text=f"This PC over Bluetooth:  {name}   [{mac}]"))
+        threading.Thread(target=work, daemon=True).start()
 
     def _install_vgamepad(self):
         if not messagebox.askyesno(APP_NAME,
@@ -400,6 +507,7 @@ class App(tk.Tk):
                                    "(A driver installer window may pop up - "
                                    "accept it.)"):
             return
+
         def work():
             r = subprocess.run([sys.executable, "-m", "pip",
                                 "install", "vgamepad"],
@@ -410,46 +518,44 @@ class App(tk.Tk):
             self.after(0, lambda: messagebox.showinfo(APP_NAME, msg))
         threading.Thread(target=work, daemon=True).start()
 
-    # ---------------- periodic UI update
+    def _restart_bt(self):
+        self.bt.stop()
+        self.bt = BtServer()
+
+    def _restart_cable(self):
+        self.cable.stop()
+        self.cable = CableServer()
+
     def _tick(self):
-        e = self.engine
         if GAMEPAD is not None:
             self.lbl_pad.config(text="Virtual Xbox 360 pad:  ACTIVE ✔",
                                 fg="#2e7d32")
         else:
-            self.lbl_pad.config(text="Virtual pad:  NOT ACTIVE (monitor mode)",
-                                fg="#c62828")
-        if e.link_active:
-            self.lbl_link.config(fg="#2e7d32",
-                                 text=f"Receiving from {e.sender_ip}"
-                                      f"   -   {e.pps} packets/s")
-            msg = f"live from {e.sender_ip}"
+            self.lbl_pad.config(text="Virtual pad:  NOT ACTIVE "
+                                     "(monitor mode)", fg="#c62828")
+        bt = self.bt
+        color = "#2e7d32" if bt.link_active else "#e65100"
+        extra = f"   -   {bt.pps} packets/s" if bt.link_active else ""
+        self.lbl_bt.config(text="Bluetooth:  " + bt.status + extra, fg=color)
+        self.lbl_log.config(text="\n".join(bt.events))
+
+        cab = self.cable
+        ccolor = "#2e7d32" if cab.link_active else "#e65100"
+        cextra = f"   -   {cab.pps} packets/s" if cab.link_active else ""
+        self.lbl_cable.config(text=cab.status + cextra, fg=ccolor)
+
+        if bt.link_active:
+            state, msg = bt.latest, "live over Bluetooth"
+        elif cab.link_active:
+            state, msg = cab.latest, "live over USB cable"
         else:
-            self.lbl_link.config(fg="#e65100",
-                                 text=f"Waiting for sender on port "
-                                      f"{e.port}...")
-            msg = "no data arriving"
-        self.lbl_err.config(text=e.error)
-        self.view.show(e.latest, msg)
+            state, msg = (0, 0, 0, 0, 0, 0, 0), "no data arriving"
+        self.view.show(state, msg)
         self.after(33, self._tick)
 
-    # ---------------- config / close
-    def _load_port(self):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-                return int(json.load(fh).get("port", DEFAULT_PORT))
-        except Exception:
-            return DEFAULT_PORT
-
-    def _save_port(self):
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-                json.dump({"port": self.port}, fh)
-        except OSError:
-            pass
-
     def _close(self):
-        self.engine.stop()
+        self.bt.stop()
+        self.cable.stop()
         self.destroy()
 
 

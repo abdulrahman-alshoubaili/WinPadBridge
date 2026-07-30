@@ -1,31 +1,83 @@
-"""WinPadBridge Sender (GUI) -- run this ON THE HANDHELD (or any Windows PC).
+"""WinPadBridge Sender v0.5 -- run this ON THE HANDHELD.
 
-Double-click this file to open it. No terminal needed.
-Needs only plain Python (3.11+). No extra packages.
+Bluetooth only (plus optional USB cable). Fullscreen. Exit ONLY with the
+red EXIT button (touch).
 
-Tabs:
-  * Home            - find the receiver PC, start/stop streaming, status
-  * Controller Test - live picture of what the handheld's controls output
-  * Help            - setup steps and troubleshooting
+Why fullscreen?  In Desktop control mode many Windows handhelds turn the
+right stick into a mouse and LT into Shift+Tab, which used to throw you
+out of the window. Fullscreen + always-on-top means stray clicks land
+here and nothing can steal the screen while you verify.
 """
 
 import ctypes
 import json
 import os
+import re
 import socket
 import struct
+import subprocess
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_NAME = "WinPadBridge Sender  (handheld)"
-DEFAULT_PORT = 47845
-RATE_HZ = 250
-PACKET_FMT = "<IHBBhhhh"          # seq, buttons, LT, RT, LX, LY, RX, RY
-DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"
-HERE_MSG = b"WINPADBRIDGE_HERE"
+APP_NAME = "WinPadBridge Sender"
+BT_CHANNELS = (4, 5, 6, 7)              # RFCOMM channels tried in order
+PACKET_FMT = "<IHBBhhhh"                # seq, buttons, LT, RT, LX, LY, RX, RY
+HELLO = b"WINPADBRIDGE?"                # handshake: sender -> receiver
+WELCOME = b"WINPADBRIDGE!"              # handshake: receiver -> sender
+DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"  # USB-cable discovery: sender -> PC
+HERE_MSG = b"WINPADBRIDGE_HERE"          # USB-cable discovery: PC -> sender
+CABLE_PORT = 47845
+
+
+def discover_over_cable(timeout=2.5):
+    """Find the receiver PC over a USB data-link cable (it enumerates as a
+    normal network adapter, usually with a 169.254.x.x link-local address).
+    Broadcasts on every local network interface and returns the first
+    reply."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.settimeout(0.4)
+    targets = {("255.255.255.255", CABLE_PORT)}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127."):
+                continue
+            net = ip.rsplit(".", 1)[0]
+            targets.add((net + ".255", CABLE_PORT))
+    except OSError:
+        pass
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            for t in targets:
+                try:
+                    s.sendto(DISCOVER_MSG, t)
+                except OSError:
+                    pass
+            try:
+                data, addr = s.recvfrom(64)
+                if data == HERE_MSG:
+                    return addr[0]
+            except socket.timeout:
+                continue
+    finally:
+        s.close()
+    return None
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".winpadbridge_sender.json")
+NO_WINDOW = 0x08000000
+AF_BT = getattr(socket, "AF_BLUETOOTH", getattr(socket, "AF_BTH", None))
+BT_PROTO = getattr(socket, "BTPROTO_RFCOMM",
+                   getattr(socket, "BTHPROTO_RFCOMM", 3))
+
+BG = "#101216"
+FG = "#e8e8e8"
+GOOD = "#43d167"
+BAD = "#ff5a52"
+WARN = "#ffb02e"
 
 
 # ----------------------------------------------------------------- XInput ---
@@ -50,44 +102,54 @@ def load_xinput():
             return getattr(ctypes.windll, name)
         except OSError:
             continue
-    raise RuntimeError("XInput not found (this must run on Windows).")
+    raise RuntimeError("XInput not found (this must run on Windows.")
 
 
-# ---------------------------------------------------------------- discovery -
-def discover_receiver(port, timeout=2.5):
-    """Broadcast a hello; the receiver app answers with its address."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.settimeout(timeout)
+# ---------------------------------------------------- Bluetooth device scan --
+def list_paired_bluetooth():
+    """Return [(name, mac)] of Bluetooth devices paired with this device."""
+    ps = ("Get-PnpDevice -Class Bluetooth | "
+          "Where-Object {$_.InstanceId -like 'BTHENUM\\DEV_*'} | "
+          "Select-Object FriendlyName, InstanceId | ConvertTo-Json -Compress")
     try:
-        s.sendto(DISCOVER_MSG, ("255.255.255.255", port))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                data, addr = s.recvfrom(64)
-            except socket.timeout:
-                break
-            if data == HERE_MSG:
-                return addr[0]
-    except OSError:
-        pass
-    finally:
-        s.close()
-    return None
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=20,
+                           creationflags=NO_WINDOW)
+        raw = (r.stdout or "").strip()
+        if not raw:
+            return []
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+    except Exception:
+        return []
+    seen = {}
+    for item in data:
+        iid = item.get("InstanceId", "") or ""
+        name = item.get("FriendlyName", "") or "Unknown device"
+        m = re.search(r"DEV_([0-9A-Fa-f]{12})", iid)
+        if not m:
+            continue
+        h = m.group(1).lower()
+        mac = ":".join(h[i:i + 2] for i in range(0, 12, 2))
+        seen.setdefault(mac, name)
+    return [(name, mac) for mac, name in seen.items()]
 
 
-# ------------------------------------------------------------------ engine --
-class Engine:
-    """Background thread: polls the handheld's gamepad, optionally streams it."""
+# --------------------------------------------------------------- gamepad ----
+class PadEngine:
+    """Polls the handheld's gamepad on all 4 XInput slots, tracks activity."""
 
     def __init__(self):
         self.stop_ev = threading.Event()
-        self.sending = False
-        self.target = None                     # (ip, port)
         self.controller_ok = False
+        self.slot = -1
+        self.activity = False
+        self._last_pkt = None
+        self._last_change = 0.0
         self.latest = (0, 0, 0, 0, 0, 0, 0)
-        self.pps = 0
         self.error = ""
+        self.changed = threading.Event()
         threading.Thread(target=self.run, daemon=True).start()
 
     def stop(self):
@@ -99,40 +161,217 @@ class Engine:
         except Exception as e:
             self.error = str(e)
             return
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         state = XInputState()
-        period = 1.0 / RATE_HZ
-        seq = 0
-        count = 0
-        t0 = time.monotonic()
-
         while not self.stop_ev.is_set():
-            ok = xinput.XInputGetState(0, ctypes.byref(state)) == 0
+            slot = -1
+            for i in range(4):
+                if xinput.XInputGetState(i, ctypes.byref(state)) == 0:
+                    slot = i
+                    break
+            ok = slot >= 0
             self.controller_ok = ok
+            self.slot = slot
+            now = time.monotonic()
             if ok:
+                if state.dwPacketNumber != self._last_pkt:
+                    self._last_pkt = state.dwPacketNumber
+                    self._last_change = now
+                self.activity = (now - self._last_change) < 2.0
                 g = state.Gamepad
-                self.latest = (g.wButtons, g.bLeftTrigger, g.bRightTrigger,
-                               g.sThumbLX, g.sThumbLY,
-                               g.sThumbRX, g.sThumbRY)
-                if self.sending and self.target:
-                    seq = (seq + 1) & 0xFFFFFFFF
-                    try:
-                        sock.sendto(struct.pack(PACKET_FMT, seq, *self.latest),
-                                    self.target)
-                        count += 1
-                    except OSError as e:
-                        self.error = f"Send failed: {e}"
-                        self.sending = False
-                time.sleep(period)
+                new_state = (g.wButtons, g.bLeftTrigger, g.bRightTrigger,
+                            g.sThumbLX, g.sThumbLY,
+                            g.sThumbRX, g.sThumbRY)
+                if new_state != self.latest:
+                    self.latest = new_state
+                    self.changed.set()
+                time.sleep(0.001)
             else:
+                self.activity = False
                 self.latest = (0, 0, 0, 0, 0, 0, 0)
                 time.sleep(0.3)
 
-            now = time.monotonic()
-            if now - t0 >= 1.0:
-                self.pps = count
-                count = 0
-                t0 = now
+
+class BtStreamer(threading.Thread):
+    """Connects to the receiver PC over Bluetooth RFCOMM and streams the pad."""
+
+    def __init__(self, engine, mac):
+        super().__init__(daemon=True)
+        self.engine = engine
+        self.mac = mac
+        self.stop_ev = threading.Event()
+        self.status = "Connecting over Bluetooth..."
+        self.connected = False
+        self.pps = 0
+        self.detail = ""
+
+    @staticmethod
+    def _diagnose(errs):
+        codes = set(errs.values())
+        text = " ".join(str(c) for c in codes)
+        if 10061 in codes:
+            return ("PC reached, but the Receiver app is not "
+                    "answering. Open (or reopen) WinPadBridge Receiver on "
+                    "that PC - it must say 'Listening on channel...'. "
+                    "Retrying...")
+        if "wrong service" in text or "handshake" in text:
+            return ("Another Bluetooth service answered instead of "
+                    "WinPadBridge. Open the Receiver on that PC - I will "
+                    "find it automatically. Retrying...")
+        if codes & {10060, 10064, 10065}:
+            return ("No answer from that device. Check: is this the right "
+                    "PC?  Bluetooth ON on both?  Paired in Windows "
+                    "Settings?  Retrying...")
+        if codes & {10013, 5}:
+            return ("Access denied - the two devices are not paired. "
+                    "Pair them in Windows Settings first. Retrying...")
+        return f"Bluetooth connect failed. Retrying...  ({text[:80]})"
+
+    def stop(self):
+        self.stop_ev.set()
+
+    def run(self):
+        if AF_BT is None:
+            self.status = ("This Python build has no Bluetooth support. "
+                           "Install Python 3.11+ from python.org.")
+            return
+        while not self.stop_ev.is_set():
+            sock = None
+            errs = {}
+            for ch in BT_CHANNELS:
+                if self.stop_ev.is_set():
+                    return
+                s = None
+                try:
+                    s = socket.socket(AF_BT, socket.SOCK_STREAM,
+                                      BT_PROTO)
+                    s.settimeout(8)
+                    self.status = f"Trying PC on channel {ch}..."
+                    s.connect((self.mac, ch))
+                    try:
+                        s.setsockopt(socket.IPPROTO_TCP,
+                                     socket.TCP_NODELAY, 1)
+                    except OSError:
+                        pass
+                    # Handshake: make sure it's OUR receiver, not some
+                    # other Windows Bluetooth service on this channel.
+                    s.settimeout(3)
+                    s.sendall(HELLO)
+                    resp = b""
+                    while len(resp) < len(WELCOME):
+                        part = s.recv(len(WELCOME) - len(resp))
+                        if not part:
+                            raise OSError("closed during handshake")
+                        resp += part
+                    if resp != WELCOME:
+                        raise OSError("wrong service on this channel")
+                    sock = s
+                    break
+                except OSError as ex:
+                    errs[ch] = getattr(ex, "winerror", None) or str(ex)
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+            if sock is None:
+                self.connected = False
+                self.status = self._diagnose(errs)
+                self.detail = "  ".join(f"ch{c}: {e}"
+                                        for c, e in errs.items())
+                if self.stop_ev.wait(3):
+                    return
+                continue
+
+            self.connected = True
+            self.status = "Bluetooth CONNECTED"
+            self.detail = ""
+            sock.settimeout(4)
+            seq = 0
+            count = 0
+            t0 = time.monotonic()
+            last_sent = 0.0
+            MIN_GAP = 1.0 / 125          # hard cap: never flood the link
+            try:
+                while not self.stop_ev.is_set():
+                    self.engine.changed.wait(timeout=0.1)
+                    self.engine.changed.clear()
+                    now = time.monotonic()
+                    if now - last_sent < MIN_GAP:
+                        time.sleep(MIN_GAP - (now - last_sent))
+                        now = time.monotonic()
+                    last_sent = now
+                    seq = (seq + 1) & 0xFFFFFFFF
+                    sock.sendall(struct.pack(PACKET_FMT, seq,
+                                             *self.engine.latest))
+                    count += 1
+                    if now - t0 >= 1.0:
+                        self.pps = count
+                        count = 0
+                        t0 = now
+            except OSError:
+                self.connected = False
+                self.status = "Connection lost - reconnecting..."
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            if self.stop_ev.wait(2):
+                return
+        self.connected = False
+
+
+class CableStreamer(threading.Thread):
+    """Streams over a USB data-link cable (shows up as a network adapter)
+    using UDP to the receiver PC's IP."""
+
+    def __init__(self, engine, ip):
+        super().__init__(daemon=True)
+        self.engine = engine
+        self.ip = ip
+        self.stop_ev = threading.Event()
+        self.status = "Connecting over USB cable..."
+        self.connected = False
+        self.pps = 0
+        self.detail = ""
+
+    def stop(self):
+        self.stop_ev.set()
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        seq = 0
+        count = 0
+        t0 = time.monotonic()
+        last_sent = 0.0
+        MIN_GAP = 1.0 / 200          # cable can handle a faster cap than BT
+        self.connected = True
+        self.status = f"USB cable: streaming to {self.ip}"
+        try:
+            while not self.stop_ev.is_set():
+                self.engine.changed.wait(timeout=0.1)
+                self.engine.changed.clear()
+                now = time.monotonic()
+                if now - last_sent < MIN_GAP:
+                    time.sleep(MIN_GAP - (now - last_sent))
+                    now = time.monotonic()
+                last_sent = now
+                seq = (seq + 1) & 0xFFFFFFFF
+                try:
+                    sock.sendto(struct.pack(PACKET_FMT, seq,
+                                            *self.engine.latest),
+                               (self.ip, CABLE_PORT))
+                except OSError as e:
+                    self.status = f"USB cable send failed: {e}"
+                    self.connected = False
+                count += 1
+                if now - t0 >= 1.0:
+                    self.pps = count
+                    count = 0
+                    t0 = now
+        finally:
+            sock.close()
+        self.connected = False
 
 
 # --------------------------------------------------------- controller view --
@@ -175,8 +414,8 @@ class ControllerView(tk.Canvas):
         self.i["Ldot"] = c.create_oval(127, 142, 143, 158, fill="#4caf50", width=0)
         self.i["Rring"] = c.create_oval(360, 105, 450, 195, outline="#777", width=2)
         self.i["Rdot"] = c.create_oval(397, 142, 413, 158, fill="#4caf50", width=0)
-        c.create_text(135, 205, text="L stick (click = L3)", fill="#999")
-        c.create_text(405, 205, text="R stick (click = R3)", fill="#999")
+        c.create_text(135, 205, text="L stick", fill="#999")
+        c.create_text(405, 205, text="R stick", fill="#999")
         self._rect("DPAD_UP", 215, 118, 240, 143, "▲")
         self._rect("DPAD_DOWN", 215, 173, 240, 198, "▼")
         self._rect("DPAD_LEFT", 190, 145, 215, 170, "◀")
@@ -221,181 +460,249 @@ class ControllerView(tk.Canvas):
 
 
 # -------------------------------------------------------------------- app ---
-HELP_TEXT = """HOW TO USE (handheld / sender side)
-
-1.  Open the WinPadBridge Receiver app on the other PC FIRST.
-
-2.  Connect this device to the SAME network as the receiver PC.
-    Best on the go: the receiver PC's Mobile Hotspot.
-
-3.  Press "Find receiver PC". If it finds it, the IP fills in
-    automatically. If not, type the IP shown on the
-    receiver's Home tab (hotspot is usually 192.168.137.1).
-
-4.  Press "Start streaming".
-
-CHECKING THINGS
-*  Controller Test tab must react when you press buttons.
-   If it does NOT: this device's controls are in Desktop /
-   Mouse mode. Open Armoury Crate / Command Center (or your
-   device's equivalent control-mode app) and switch to
-   Gamepad mode, then try again.
-*  Close any game running on this device itself - a game can
-   grab the controller exclusively.
-*  "Find receiver PC" fails on networks that block broadcast
-   (some public Wi-Fi). Use the receiver's hotspot, or type
-   the IP by hand.
-
-Streaming keeps running while this window is open."""
-
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.resizable(False, False)
-        self.engine = Engine()
+        self.configure(bg=BG)
+        self.attributes("-fullscreen", True)
+        self.attributes("-topmost", True)
+        self.option_add("*TCombobox*Listbox.font", ("Segoe UI", 14))
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
-        self.tab_home = ttk.Frame(nb)
-        self.tab_test = ttk.Frame(nb)
-        self.tab_help = ttk.Frame(nb)
-        nb.add(self.tab_home, text="   Home   ")
-        nb.add(self.tab_test, text="   Controller Test   ")
-        nb.add(self.tab_help, text="   Help   ")
+        self.engine = PadEngine()
+        self.bt = None
+        self.cable = None
+        self.bt_devices = []
 
-        self._build_home()
-        self._build_test()
-        self._build_help()
+        # ---- top bar with the ONLY exit
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=20, pady=(14, 4))
+        tk.Label(top, text="WinPadBridge Sender", bg=BG, fg=FG,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        tk.Button(top, text="  ✕  EXIT  ", bg="#c62828", fg="white",
+                  font=("Segoe UI", 16, "bold"), bd=0, takefocus=0,
+                  activebackground="#e53935", activeforeground="white",
+                  command=self._close).pack(side="right", ipadx=8, ipady=6)
+        tk.Label(top, text="(touch here to close - buttons can't close it)",
+                 bg=BG, fg="#888", font=("Segoe UI", 10)).pack(side="right",
+                                                               padx=12)
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(expand=True)
+
+        tk.Label(body, bg=BG, fg="#9aa0a6", font=("Segoe UI", 12),
+                 text="One-time: pair Bluetooth in Windows Settings, or "
+                      "plug in a USB data-link cable."
+                 ).pack(pady=(0, 8))
+
+        self.mode = tk.StringVar(value="bt")
+        mrow = tk.Frame(body, bg=BG)
+        mrow.pack(pady=2)
+        for val, label in (("bt", "Bluetooth"), ("cable", "USB cable")):
+            tk.Radiobutton(mrow, text=label, variable=self.mode, value=val,
+                          bg=BG, fg=FG, selectcolor="#2b2f36",
+                          activebackground=BG, activeforeground=FG,
+                          font=("Segoe UI", 13, "bold"), takefocus=0,
+                          command=self._on_mode_change)\
+                .pack(side="left", padx=10)
+
+        self.row_bt = tk.Frame(body, bg=BG)
+        self.btn_scan = tk.Button(self.row_bt, text="Scan paired devices",
+                                  font=("Segoe UI", 14, "bold"),
+                                  takefocus=0, command=self._scan_bt,
+                                  bd=0, bg="#2b2f36", fg=FG,
+                                  activebackground="#3a4048",
+                                  activeforeground=FG)
+        self.btn_scan.pack(side="left", ipadx=14, ipady=10, padx=8)
+        self.bt_combo = ttk.Combobox(self.row_bt, width=28,
+                                     font=("Segoe UI", 14))
+        self.bt_combo.pack(side="left", padx=8, ipady=6)
+
+        self.row_cable = tk.Frame(body, bg=BG)
+        tk.Label(self.row_cable, text="Just plug in the USB cable and "
+                 "press START - the receiver PC is found automatically.",
+                 bg=BG, fg="#9aa0a6", font=("Segoe UI", 12))\
+            .pack(side="left", padx=8)
+        self.cable_ip = tk.StringVar()
+        tk.Label(self.row_cable, textvariable=self.cable_ip, bg=BG,
+                 fg="#6a6f78", font=("Consolas", 11)).pack(side="left",
+                                                            padx=8)
+
+        self.row_bt.pack(pady=4)
+
+        self.btn_start = tk.Button(body, text="▶   START STREAMING",
+                                   font=("Segoe UI", 20, "bold"),
+                                   bg="#2e7d32", fg="white", bd=0,
+                                   takefocus=0, command=self._toggle,
+                                   activebackground="#37944d",
+                                   activeforeground="white")
+        self.btn_start.pack(pady=14, ipadx=30, ipady=14)
+
+        self.lbl_ctrl = tk.Label(body, bg=BG, font=("Segoe UI", 15, "bold"))
+        self.lbl_ctrl.pack()
+        self.lbl_mode = tk.Label(body, bg=BG, font=("Segoe UI", 15, "bold"),
+                                 wraplength=980, justify="center")
+        self.lbl_mode.pack(pady=4)
+        self.lbl_link = tk.Label(body, bg=BG, font=("Segoe UI", 15, "bold"))
+        self.lbl_link.pack(pady=(0, 2))
+        self.lbl_detail = tk.Label(body, bg=BG, fg="#8a8f98",
+                                   font=("Consolas", 10), wraplength=980)
+        self.lbl_detail.pack(pady=(0, 6))
+
+        self.view = ControllerView(body)
+        self.view.pack(pady=6)
+
+        tk.Label(self, bg=BG, fg="#777", font=("Segoe UI", 10),
+                 text="Keep this window open while playing on the "
+                      "receiver PC."
+                 ).pack(side="bottom", pady=8)
+
         self._load_config()
-
+        self.focus_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(33, self._tick)
 
-    # ---------------- home tab
-    def _build_home(self):
-        f = self.tab_home
-        pad = {"padx": 12, "pady": 8}
-
-        tk.Label(f, text="Receiver PC IP:", font=("Segoe UI", 10))\
-            .grid(row=0, column=0, sticky="w", **pad)
-        self.ip_var = tk.StringVar()
-        tk.Entry(f, textvariable=self.ip_var, width=18,
-                 font=("Consolas", 12)).grid(row=0, column=1, sticky="w")
-        self.btn_find = tk.Button(f, text="Find receiver PC",
-                                  command=self._find)
-        self.btn_find.grid(row=0, column=2, padx=12)
-
-        tk.Label(f, text="Port:").grid(row=1, column=0, sticky="w", **pad)
-        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
-        tk.Entry(f, textvariable=self.port_var, width=8)\
-            .grid(row=1, column=1, sticky="w")
-
-        self.btn_start = tk.Button(f, text="▶  Start streaming",
-                                   font=("Segoe UI", 13, "bold"),
-                                   bg="#2e7d32", fg="white", width=22,
-                                   command=self._toggle)
-        self.btn_start.grid(row=2, column=0, columnspan=3, pady=14)
-
-        self.lbl_ctrl = tk.Label(f, font=("Segoe UI", 11, "bold"))
-        self.lbl_ctrl.grid(row=3, column=0, columnspan=3, sticky="w", padx=12)
-        self.lbl_link = tk.Label(f, font=("Segoe UI", 11))
-        self.lbl_link.grid(row=4, column=0, columnspan=3, sticky="w", padx=12)
-        self.lbl_err = tk.Label(f, fg="#c62828", wraplength=480,
-                                justify="left")
-        self.lbl_err.grid(row=5, column=0, columnspan=3, sticky="w",
-                          padx=12, pady=(0, 10))
-
-    # ---------------- test tab
-    def _build_test(self):
-        tk.Label(self.tab_test, justify="left",
-                 text=("This shows what this device's controls are outputting, "
-                       "live - even before you press Start.\n"
-                       "If nothing reacts here, switch the control mode to "
-                       "Gamepad (Armoury Crate / Command Center, or your "
-                       "device's equivalent).")
-                 ).pack(anchor="w", padx=10, pady=6)
-        self.view = ControllerView(self.tab_test)
-        self.view.pack(padx=10, pady=4)
-
-    # ---------------- help tab
-    def _build_help(self):
-        txt = tk.Text(self.tab_help, wrap="word", width=64, height=22,
-                      font=("Consolas", 9))
-        txt.insert("1.0", HELP_TEXT)
-        txt.config(state="disabled")
-        txt.pack(fill="both", expand=True, padx=8, pady=8)
-
     # ---------------- actions
-    def _find(self):
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            messagebox.showerror(APP_NAME, "Port must be a number.")
-            return
-        self.btn_find.config(state="disabled", text="Searching...")
+    def _on_mode_change(self):
+        if self.mode.get() == "bt":
+            self.row_cable.pack_forget()
+            self.row_bt.pack(pady=4)
+        else:
+            self.row_bt.pack_forget()
+            self.row_cable.pack(pady=4)
+
+    def _scan_bt(self):
+        self.btn_scan.config(state="disabled", text="Scanning...")
 
         def work():
-            ip = discover_receiver(port)
+            devs = list_paired_bluetooth()
+
             def done():
-                self.btn_find.config(state="normal", text="Find receiver PC")
-                if ip:
-                    self.ip_var.set(ip)
+                self.btn_scan.config(state="normal",
+                                     text="Scan paired devices")
+                self.bt_devices = devs
+                if devs:
+                    vals = [f"{name}  [{mac}]" for name, mac in devs]
+                    self.bt_combo["values"] = vals
+                    self.bt_combo.set(vals[0])
                 else:
                     messagebox.showwarning(
                         APP_NAME,
-                        "Receiver PC not found.\n\nCheck that:\n"
-                        "1. The Receiver app is OPEN on that PC\n"
-                        "2. Both devices are on the SAME network\n"
-                        "3. That PC's firewall allowed Python\n\n"
-                        "You can also type the IP shown on the "
-                        "receiver's Home tab.")
+                        "No paired devices found.\n\nPair first:\n"
+                        "Settings → Bluetooth → Add device → "
+                        "choose the receiver PC → accept the PIN on both.",
+                        parent=self)
             self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
 
+    def _selected_mac(self):
+        m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})",
+                      self.bt_combo.get())
+        return m.group(1).lower() if m else None
+
     def _toggle(self):
-        e = self.engine
-        if not e.sending:
-            ip = self.ip_var.get().strip()
-            if not ip:
-                messagebox.showerror(APP_NAME,
-                                     "Enter the receiver PC's IP first, or press "
-                                     "'Find receiver PC'.")
+        active = (self.bt and self.bt.is_alive()) or \
+                 (self.cable and self.cable.is_alive())
+        if active:
+            if self.bt:
+                self.bt.stop()
+                self.bt = None
+            if self.cable:
+                self.cable.stop()
+                self.cable = None
+            self.btn_start.config(text="▶   START STREAMING", bg="#2e7d32")
+            return
+        if self.mode.get() == "bt":
+            mac = self._selected_mac()
+            if not mac:
+                messagebox.showerror(
+                    APP_NAME,
+                    "Touch 'Scan paired devices' and choose your receiver "
+                    "PC first.", parent=self)
                 return
-            try:
-                port = int(self.port_var.get())
-            except ValueError:
-                messagebox.showerror(APP_NAME, "Port must be a number.")
-                return
-            e.error = ""
-            e.target = (ip, port)
-            e.sending = True
-            self._save_config()
-            self.btn_start.config(text="■  Stop streaming", bg="#c62828")
+            self.bt = BtStreamer(self.engine, mac)
+            self.bt.start()
         else:
-            e.sending = False
-            self.btn_start.config(text="▶  Start streaming", bg="#2e7d32")
+            ip = self.cable_ip.get().strip()
+            if not ip:
+                self.btn_start.config(text="Searching for receiver PC...",
+                                      state="disabled")
+                self.update_idletasks()
+                ip = discover_over_cable()
+                self.btn_start.config(state="normal")
+                if not ip:
+                    messagebox.showerror(
+                        APP_NAME,
+                        "Could not find the receiver PC over the USB "
+                        "cable.\n\nCheck: is a USB DATA-LINK cable used "
+                        "(not a plain charge cable)? Is the Receiver app "
+                        "open on that PC? Is the cable fully plugged in "
+                        "on both ends?",
+                        parent=self)
+                    self.btn_start.config(text="▶   START STREAMING",
+                                          bg="#2e7d32")
+                    return
+                self.cable_ip.set(ip)
+            self.cable = CableStreamer(self.engine, ip)
+            self.cable.start()
+        self._save_config()
+        self.btn_start.config(text="■   STOP", bg="#c62828")
 
     # ---------------- periodic UI update
     def _tick(self):
         e = self.engine
         if e.controller_ok:
-            self.lbl_ctrl.config(text="Controller:  DETECTED ✔", fg="#2e7d32")
-        else:
             self.lbl_ctrl.config(
-                text="Controller:  NOT DETECTED  "
-                     "(set Gamepad mode in Armoury Crate)",
-                fg="#c62828")
-        if e.sending and e.target:
-            self.lbl_link.config(
-                text=f"Streaming to {e.target[0]}:{e.target[1]}   -   "
-                     f"{e.pps} packets/s", fg="#2e7d32")
-            msg = "streaming"
+                text=f"Controller detected  (slot {e.slot})  ✔", fg=GOOD)
+            if e.activity:
+                self.lbl_mode.config(
+                    text="GAMEPAD MODE ✔  - your buttons are reaching "
+                         "the app.", fg=GOOD)
+            else:
+                self.lbl_mode.config(
+                    text="DESKTOP / MOUSE MODE DETECTED - that is why the "
+                         "mouse moves when you use the sticks.\n"
+                         "FIX:  press the Command Center button (or your "
+                         "device's equivalent)  →  Control Mode  →  "
+                         "GAMEPAD.\n"
+                         "This text turns green the moment it works.",
+                    fg=BAD)
         else:
-            self.lbl_link.config(text="Not streaming", fg="#666")
-            msg = "not streaming (local view only)"
-        self.lbl_err.config(text=e.error)
+            self.lbl_ctrl.config(text="Controller NOT detected", fg=BAD)
+            self.lbl_mode.config(
+                text="Press the Command Center button (or your device's "
+                     "equivalent)  →  Control Mode  →  GAMEPAD,\nand close "
+                     "any game running on this device.",
+                fg=BAD)
+
+        if self.bt and self.bt.is_alive():
+            color = GOOD if self.bt.connected else WARN
+            extra = f"   ({self.bt.pps} packets/s)" if self.bt.connected \
+                else ""
+            self.lbl_link.config(text=self.bt.status + extra, fg=color)
+            self.lbl_detail.config(text=self.bt.detail)
+            msg = "streaming over Bluetooth" if self.bt.connected \
+                else "connecting..."
+        elif self.cable and self.cable.is_alive():
+            color = GOOD if self.cable.connected else WARN
+            extra = f"   ({self.cable.pps} packets/s)" \
+                if self.cable.connected else ""
+            self.lbl_link.config(text=self.cable.status + extra, fg=color)
+            self.lbl_detail.config(text="")
+            msg = "streaming over USB cable" if self.cable.connected \
+                else "connecting..."
+        else:
+            self.btn_start.config(text="▶   START STREAMING", bg="#2e7d32")
+            if self.bt is not None:
+                self.lbl_link.config(text=self.bt.status, fg=BAD)
+                self.lbl_detail.config(text=self.bt.detail)
+            elif self.cable is not None:
+                self.lbl_link.config(text=self.cable.status, fg=BAD)
+                self.lbl_detail.config(text="")
+            else:
+                self.lbl_link.config(text="Not streaming yet", fg="#9aa0a6")
+                self.lbl_detail.config(text="")
+            msg = "local view - press START when ready"
         self.view.show(e.latest, msg)
         self.after(33, self._tick)
 
@@ -404,20 +711,29 @@ class App(tk.Tk):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
                 cfg = json.load(fh)
-            self.ip_var.set(cfg.get("ip", ""))
-            self.port_var.set(str(cfg.get("port", DEFAULT_PORT)))
+            if cfg.get("bt_choice"):
+                self.bt_combo.set(cfg["bt_choice"])
+            if cfg.get("cable_ip"):
+                self.cable_ip.set(cfg["cable_ip"])
+            self.mode.set(cfg.get("mode", "bt"))
         except Exception:
             pass
+        self._on_mode_change()
 
     def _save_config(self):
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-                json.dump({"ip": self.ip_var.get().strip(),
-                           "port": int(self.port_var.get())}, fh)
+                json.dump({"bt_choice": self.bt_combo.get(),
+                           "cable_ip": self.cable_ip.get().strip(),
+                           "mode": self.mode.get()}, fh)
         except Exception:
             pass
 
     def _close(self):
+        if self.bt:
+            self.bt.stop()
+        if self.cable:
+            self.cable.stop()
         self.engine.stop()
         self.destroy()
 

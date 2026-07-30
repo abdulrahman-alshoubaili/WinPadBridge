@@ -1,58 +1,89 @@
 # WinPadBridge
 
-Turn any Windows handheld (ROG Ally, Legion Go, GPD Win, AYANEO, or similar) into a wireless controller for another Windows PC — for example, to play PS2 games in PCSX2 on your desktop when you forgot your DualSense at home, or to use the handheld as a spare pad for any other Windows game.
+Turn any Windows handheld (ROG Ally, Legion Go, GPD Win, AYANEO, or similar)
+into a wireless (or wired) controller for another Windows PC. Built to solve
+a real problem: playing PS2 games in **PCSX2** on a PC after forgetting a
+real controller at home — using the handheld's own built-in gamepad instead.
 
-## Why USB / Bluetooth alone doesn't work
+No installer, no drivers to hunt down beyond one official one, no command
+line required to run it day-to-day — both apps are plain windowed Python
+programs.
 
-A Windows handheld is a full PC, just like the receiving PC. Both are USB and Bluetooth *hosts*, and a controller is a *peripheral* — a PC cannot present itself as a gamepad over those connections. So WinPadBridge goes over the network instead:
+## How it works
+
+The handheld and the PC are both full Windows PCs — and two PCs can't
+plug a controller into each other directly, since neither can "pretend"
+to be a USB peripheral. WinPadBridge works around that by streaming the
+handheld's gamepad state to the other PC over a link, where it's turned
+into a real virtual Xbox 360 controller that any game (PCSX2 included)
+can use.
 
 ```
-Handheld (sender)                       PC (receiver)
-built-in gamepad (XInput)               virtual Xbox 360 pad (ViGEmBus)
-        |                                       ^
-     sender.py    --- UDP over Wi-Fi --->   receiver.py   ---> PCSX2 / any game
+Handheld                                      PC
+built-in gamepad (XInput)                     virtual Xbox 360 pad (ViGEmBus)
+        |                                             ^
+sender_gui.pyw  --  Bluetooth or USB cable  -->  receiver_gui.pyw
+                                                              |
+                                                              v
+                                                        PCSX2 / any game
 ```
 
-Two ways to run it:
-- **GUI** (`sender_gui.pyw` / `receiver_gui.pyw`) — double-click, no terminal, includes auto-discovery of the receiver PC and a live controller test view.
-- **Command line** (`sender.py` / `receiver.py`) — plain scripts, same protocol, useful for scripting or headless setups.
+Two connection methods are supported, selectable in the sender's UI:
+
+- **Bluetooth** (default) — pair the two devices once in Windows
+  Settings, no network required, unaffected by firewalls.
+- **USB cable** — needs a USB-C **data-link/bridge cable** (a
+  "PC-to-PC transfer cable"), not a plain charging cable. Windows turns
+  it into a small virtual network adapter; the app auto-discovers the
+  receiver PC over it, so no manual IP entry is needed.
+
+Both use a lightweight custom handshake/streaming protocol (not a
+standard HID/gamepad Bluetooth profile), since a Windows PC cannot
+natively act as a Bluetooth gamepad peripheral.
 
 ## Requirements
 
-Both devices: Windows 10/11 and Python 3.11 or newer (3.11+ gives accurate high-rate timing). The receiver PC additionally needs the ViGEmBus driver and the `vgamepad` package. The handheld needs nothing beyond Python.
+**Receiver PC:**
+- Windows 10/11, Python 3.11+
+- [ViGEmBus driver](https://github.com/nefarius/ViGEmBus/releases) (one-time install — creates the virtual controller)
+- `pip install vgamepad` (the receiver can also install this for you from its own UI)
 
-## Setup — Receiver PC
-
-1. Install Python 3.11+ from python.org or the Microsoft Store.
-2. Install the ViGEmBus driver: download `ViGEmBus_x64.exe` from https://github.com/nefarius/ViGEmBus/releases and run it.
-3. `pip install vgamepad` (if a driver installer window pops up during this, accept it — or use the "Install vgamepad" button in the GUI).
-4. On first run, Windows Firewall will ask about Python — allow it on **both private and public** networks. Or run this once in an admin terminal:
-   `netsh advfirewall firewall add rule name="WinPadBridge" dir=in action=allow protocol=UDP localport=47845`
-
-## Setup — Handheld (sender)
-
-1. Install Python 3.11+. That's it — the sender uses only the standard library.
+**Handheld (sender):**
+- Windows 10/11 (or Windows-based handheld OS), Python 3.11+
+- No extra packages — standard library only
 
 ## Running it
 
-1. Put both devices on the same network. **Away from home:** on the receiver PC, turn on Settings → Network & internet → Mobile hotspot, then connect the handheld to that hotspot. In hotspot mode the receiver's IP is usually `192.168.137.1` (check with `ipconfig`).
-2. On the receiver PC: `python receiver.py` (or double-click `receiver_gui.pyw`)
-3. On the handheld (in desktop mode): `python sender.py 192.168.137.1` (use the receiver's IP, or use `sender_gui.pyw`'s "Find receiver PC" button)
-4. The receiver PC now has an "Xbox 360 Controller" — any game or emulator that supports Xbox controllers will pick it up. In PCSX2, for example: Settings → Controllers → Controller Port 1 → Automatic Mapping → pick the Xbox 360 pad. Done — play.
+1. **Receiver PC:** open `receiver_gui.pyw`. It listens on both Bluetooth
+   and USB cable at the same time.
+2. **Handheld:** make sure the controls are in **Gamepad mode**, not
+   Desktop/Mouse mode (Command Center button, Armoury Crate, or your
+   device's equivalent → Control Mode → Gamepad). In Desktop mode the
+   sticks act as a mouse and won't be seen as gamepad input by any app.
+3. Open `sender_gui.pyw`, pick Bluetooth or USB cable, press **Start**.
+4. Once connected, open PCSX2 (or any game) →
+   Settings → Controllers → Automatic Mapping → pick the Xbox 360
+   controller.
 
-## Troubleshooting
+Both apps include a live controller-test view and step-by-step help
+built into the UI, so most setup issues are diagnosed on-screen.
 
-- **Receiver gets nothing:** almost always Windows Firewall. Allow Python on private *and* public networks (hotspot networks often count as public), and confirm the IP with `ipconfig`.
-- **Sender says "Controller 0 not detected":** set the handheld's controls to Gamepad/XInput mode (Armoury Crate / Command Center or your device's equivalent), and exit any game running on the handheld.
-- **Feels laggy:** use the receiver's Mobile hotspot (direct link) instead of a crowded public Wi-Fi. At 250 Hz over a direct link, added delay is only a few milliseconds.
-- **Link drops mid-game:** the receiver automatically releases all buttons after 0.5 s so nothing gets stuck.
+## Project background
 
-## Roadmap ideas
+Built iteratively through real hands-on debugging: starting from a
+terminal-only prototype, through a GUI rebuild, discovering the
+Desktop/Mouse-mode trap on Windows handhelds, adding Bluetooth after
+Wi-Fi/firewall issues, fixing a Bluetooth-constant naming bug
+(`AF_BTH` vs `AF_BLUETOOTH`), fixing a bufferbloat latency bug from an
+over-aggressive send rate, and finally adding the USB cable option as an
+alternative to Bluetooth.
 
-DS4 mode (`vg.VDS4Gamepad`) for apps that want a PlayStation pad; rumble backchannel (ViGEmBus forwards vibration → send it back over UDP → `XInputSetState` on the handheld); gyro from the handheld's sensors mapped to DS4 motion; a packaged `.exe` (PyInstaller) so Python isn't required.
+## License
 
-## Note on existing tools
+MIT — do whatever you like with it.
 
-Streaming apps (Moonlight/Sunshine, Parsec, Steam Remote Play) can also forward a controller, but they stream the whole screen and need more setup. WinPadBridge only sends input: tiny, offline-friendly, and fully ours.
+## Disclaimer
 
-License: MIT.
+This project only *reads* controller input and streams it as data; it
+does not modify system security settings. Use official drivers
+(ViGEmBus) from their original source.
