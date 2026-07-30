@@ -654,13 +654,18 @@ class App(tk.Tk):
 
         self.lbl_ctrl = tk.Label(body, bg=BG, font=("Segoe UI", 15, "bold"))
         self.lbl_ctrl.pack()
+        # Fixed height on lbl_mode/lbl_detail: their text switches between
+        # short and long (e.g. a 1-line "GAMEPAD MODE" vs a 3-line desktop-
+        # mode warning), which otherwise reflows and shifts every widget
+        # below it each time the message changes.
         self.lbl_mode = tk.Label(body, bg=BG, font=("Segoe UI", 15, "bold"),
-                                 wraplength=980, justify="center")
+                                 wraplength=980, justify="center", height=3)
         self.lbl_mode.pack(pady=4)
         self.lbl_link = tk.Label(body, bg=BG, font=("Segoe UI", 15, "bold"))
         self.lbl_link.pack(pady=(0, 2))
         self.lbl_detail = tk.Label(body, bg=BG, fg="#8a8f98",
-                                   font=("Consolas", 10), wraplength=980)
+                                   font=("Consolas", 10), wraplength=980,
+                                   height=2)
         self.lbl_detail.pack(pady=(0, 6))
 
         # Controller diagram and touchpad sit side-by-side (not stacked) so
