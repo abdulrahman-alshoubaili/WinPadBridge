@@ -1,13 +1,14 @@
-"""AllyPad sender -- run this ON THE ROG ALLY X.
+"""WinPadBridge sender -- run this ON THE HANDHELD (or any Windows PC).
 
-Reads the Ally's built-in gamepad (XInput) and streams its state
-over UDP to the receiver running on your laptop.
+Reads a connected Windows XInput gamepad (built-in on handhelds like the
+ROG Ally, Legion Go, GPD Win, or AYANEO) and streams its state over UDP
+to the receiver running on the other PC.
 
 Usage:
-    python sender_ally.py <laptop-ip> [port]
+    python sender.py <receiver-ip> [port]
 
-Example (laptop running Windows Mobile Hotspot):
-    python sender_ally.py 192.168.137.1
+Example (receiver PC running Windows Mobile Hotspot):
+    python sender.py 192.168.137.1
 
 No extra packages needed -- Python 3.11+ standard library only.
 """
@@ -67,7 +68,7 @@ def main():
     seq = 0
     warned = False
 
-    print(f"AllyPad sender: streaming controller 0 -> {target_ip}:{port} "
+    print(f"WinPadBridge sender: streaming controller 0 -> {target_ip}:{port} "
           f"at {RATE_HZ} Hz. Press Ctrl+C to stop.")
 
     try:
@@ -86,8 +87,8 @@ def main():
                 time.sleep(period)
             else:
                 if not warned:
-                    print("Controller 0 not detected. Make sure the Ally's "
-                          "controls are in Gamepad mode. Retrying...")
+                    print("Controller 0 not detected. Make sure your handheld's "
+                          "controls are in Gamepad/XInput mode. Retrying...")
                     warned = True
                 time.sleep(0.5)
     except KeyboardInterrupt:

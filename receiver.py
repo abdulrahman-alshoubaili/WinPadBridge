@@ -1,15 +1,15 @@
-"""AllyPad receiver -- run this ON THE LAPTOP.
+"""WinPadBridge receiver -- run this ON THE PC you want to control games on.
 
 Creates a virtual Xbox 360 controller (via the ViGEmBus driver) and
-mirrors the gamepad state streamed from the Ally. PCSX2 and any other
-game will see it as a normal Xbox 360 pad.
+mirrors the gamepad state streamed from the sender. Any Windows game or
+emulator (PCSX2, Dolphin, Steam, etc.) will see it as a normal Xbox 360 pad.
 
-Prerequisites (laptop only):
+Prerequisites (this PC only):
     1. Install the ViGEmBus driver (see README).
     2. pip install vgamepad
 
 Usage:
-    python receiver_laptop.py [port]
+    python receiver.py [port]
 """
 
 import socket
@@ -60,9 +60,9 @@ def main():
     sock.bind(("0.0.0.0", port))
     sock.settimeout(LINK_TIMEOUT_S)
 
-    print(f"AllyPad receiver: virtual Xbox 360 pad created. "
+    print(f"WinPadBridge receiver: virtual Xbox 360 pad created. "
           f"Listening on UDP port {port}.")
-    print("Now start sender_ally.py on the Ally. Press Ctrl+C to stop.")
+    print("Now start sender.py on the handheld. Press Ctrl+C to stop.")
 
     last_seq = None
     idle = False

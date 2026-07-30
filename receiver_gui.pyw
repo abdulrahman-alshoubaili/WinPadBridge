@@ -1,11 +1,11 @@
-"""AllyPad Receiver (GUI) -- run this ON THE LAPTOP.
+"""WinPadBridge Receiver (GUI) -- run this ON THE PC you want to control games on.
 
 Double-click this file to open it. No terminal needed.
 
 It creates a virtual Xbox 360 controller (via the ViGEmBus driver) and
-mirrors whatever the AllyPad Sender streams to it. Tabs:
-  * Home            - status, your laptop's IP, start/stop listener
-  * Controller Test - live picture of what is arriving from the Ally
+mirrors whatever the WinPadBridge Sender streams to it. Tabs:
+  * Home            - status, this PC's IP, start/stop listener
+  * Controller Test - live picture of what is arriving from the sender
   * Help            - setup steps and troubleshooting
 """
 
@@ -20,13 +20,13 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_NAME = "AllyPad Receiver  (laptop)"
+APP_NAME = "WinPadBridge Receiver  (PC)"
 DEFAULT_PORT = 47845
 PACKET_FMT = "<IHBBhhhh"          # seq, buttons, LT, RT, LX, LY, RX, RY
 PACKET_SIZE = struct.calcsize(PACKET_FMT)
-DISCOVER_MSG = b"ALLYPAD_DISCOVER"
-HERE_MSG = b"ALLYPAD_HERE"
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".allypad_receiver.json")
+DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"
+HERE_MSG = b"WINPADBRIDGE_HERE"
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".winpadbridge_receiver.json")
 
 # ---------------------------------------------------------------- vgamepad --
 VG_ERROR = ""
@@ -135,7 +135,7 @@ class Engine:
             if not data:
                 continue
 
-            if data == DISCOVER_MSG:             # "Find my laptop" feature
+            if data == DISCOVER_MSG:             # "Find receiver PC" feature
                 try:
                     sock.sendto(HERE_MSG, addr)
                 except OSError:
@@ -254,7 +254,7 @@ class ControllerView(tk.Canvas):
 
 
 # -------------------------------------------------------------------- app ---
-HELP_TEXT = f"""HOW TO SET UP (laptop side)
+HELP_TEXT = f"""HOW TO SET UP (this PC / receiver side)
 
 1.  Install the ViGEmBus driver (one time only):
     open  github.com/nefarius/ViGEmBus/releases
@@ -269,11 +269,11 @@ HELP_TEXT = f"""HOW TO SET UP (laptop side)
 
     If you never saw that popup and nothing arrives, run this
     once in an admin terminal:
-    netsh advfirewall firewall add rule name="AllyPad" dir=in action=allow protocol=UDP localport={DEFAULT_PORT}
+    netsh advfirewall firewall add rule name="WinPadBridge" dir=in action=allow protocol=UDP localport={DEFAULT_PORT}
 
-4.  On the go: turn on the laptop's Mobile Hotspot
+4.  On the go: turn on this PC's Mobile Hotspot
     (Settings > Network & internet > Mobile hotspot) and
-    connect the Ally to it. Your IP is usually 192.168.137.1.
+    connect the handheld to it. Your IP is usually 192.168.137.1.
 
 READING THE STATUS
 *  "Waiting for sender"      = listening, nothing arriving yet.
@@ -282,10 +282,12 @@ READING THE STATUS
 *  If packets arrive but games see nothing, the virtual pad is
    not active - fix step 1 and 2 above.
 
-IN PCSX2
+IN YOUR GAME OR EMULATOR
+Any title that reads an Xbox 360 controller will pick this up
+automatically. Some emulators need manual mapping, e.g. in PCSX2:
 Settings > Controllers > Controller Port 1 > Automatic Mapping
 and pick the Xbox 360 controller. Do this AFTER this app is
-running (the pad must exist before PCSX2 scans)."""
+running (the pad must exist before the game/emulator scans)."""
 
 
 class App(tk.Tk):
@@ -334,7 +336,7 @@ class App(tk.Tk):
                       command=self._install_vgamepad).pack(side="right",
                                                            padx=8, pady=6)
 
-        tk.Label(f, text="Your laptop's IP (type this on the Ally):",
+        tk.Label(f, text="This PC's IP (type this on the handheld):",
                  font=("Segoe UI", 10)).grid(row=2, column=0, sticky="w", **pad)
         self.lbl_ips = tk.Label(f, font=("Consolas", 12, "bold"), fg="#1a73e8")
         self.lbl_ips.grid(row=3, column=0, columnspan=2, sticky="w", padx=12)
@@ -361,7 +363,7 @@ class App(tk.Tk):
     # ---------------- test tab
     def _build_test(self):
         tk.Label(self.tab_test, justify="left",
-                 text=("This shows what is ARRIVING from the Ally, live.\n"
+                 text=("This shows what is ARRIVING from the sender, live.\n"
                        "If it moves here, the network part works.")
                  ).pack(anchor="w", padx=10, pady=6)
         self.view = ControllerView(self.tab_test)

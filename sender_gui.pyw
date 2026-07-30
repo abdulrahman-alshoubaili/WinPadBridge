@@ -1,11 +1,11 @@
-"""AllyPad Sender (GUI) -- run this ON THE ROG ALLY X.
+"""WinPadBridge Sender (GUI) -- run this ON THE HANDHELD (or any Windows PC).
 
 Double-click this file to open it. No terminal needed.
 Needs only plain Python (3.11+). No extra packages.
 
 Tabs:
-  * Home            - find the laptop, start/stop streaming, status
-  * Controller Test - live picture of what the Ally's controls output
+  * Home            - find the receiver PC, start/stop streaming, status
+  * Controller Test - live picture of what the handheld's controls output
   * Help            - setup steps and troubleshooting
 """
 
@@ -19,13 +19,13 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_NAME = "AllyPad Sender  (ROG Ally)"
+APP_NAME = "WinPadBridge Sender  (handheld)"
 DEFAULT_PORT = 47845
 RATE_HZ = 250
 PACKET_FMT = "<IHBBhhhh"          # seq, buttons, LT, RT, LX, LY, RX, RY
-DISCOVER_MSG = b"ALLYPAD_DISCOVER"
-HERE_MSG = b"ALLYPAD_HERE"
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".allypad_sender.json")
+DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"
+HERE_MSG = b"WINPADBRIDGE_HERE"
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".winpadbridge_sender.json")
 
 
 # ----------------------------------------------------------------- XInput ---
@@ -78,7 +78,7 @@ def discover_receiver(port, timeout=2.5):
 
 # ------------------------------------------------------------------ engine --
 class Engine:
-    """Background thread: polls the Ally's gamepad, optionally streams it."""
+    """Background thread: polls the handheld's gamepad, optionally streams it."""
 
     def __init__(self):
         self.stop_ev = threading.Event()
@@ -221,14 +221,14 @@ class ControllerView(tk.Canvas):
 
 
 # -------------------------------------------------------------------- app ---
-HELP_TEXT = """HOW TO USE (Ally side)
+HELP_TEXT = """HOW TO USE (handheld / sender side)
 
-1.  Open the AllyPad Receiver app on the laptop FIRST.
+1.  Open the WinPadBridge Receiver app on the other PC FIRST.
 
-2.  Connect the Ally to the SAME network as the laptop.
-    Best on the go: the laptop's Mobile Hotspot.
+2.  Connect this device to the SAME network as the receiver PC.
+    Best on the go: the receiver PC's Mobile Hotspot.
 
-3.  Press "Find my laptop". If it finds it, the IP fills in
+3.  Press "Find receiver PC". If it finds it, the IP fills in
     automatically. If not, type the IP shown on the
     receiver's Home tab (hotspot is usually 192.168.137.1).
 
@@ -236,14 +236,15 @@ HELP_TEXT = """HOW TO USE (Ally side)
 
 CHECKING THINGS
 *  Controller Test tab must react when you press buttons.
-   If it does NOT: the Ally's controls are in Desktop /
-   Mouse mode. Open Armoury Crate / Command Center and set
-   the control mode to Gamepad, then try again.
-*  Close any game running on the Ally itself - a game can
+   If it does NOT: this device's controls are in Desktop /
+   Mouse mode. Open Armoury Crate / Command Center (or your
+   device's equivalent control-mode app) and switch to
+   Gamepad mode, then try again.
+*  Close any game running on this device itself - a game can
    grab the controller exclusively.
-*  "Find my laptop" fails on networks that block broadcast
-   (some public Wi-Fi). Use the laptop hotspot, or type the
-   IP by hand.
+*  "Find receiver PC" fails on networks that block broadcast
+   (some public Wi-Fi). Use the receiver's hotspot, or type
+   the IP by hand.
 
 Streaming keeps running while this window is open."""
 
@@ -277,12 +278,12 @@ class App(tk.Tk):
         f = self.tab_home
         pad = {"padx": 12, "pady": 8}
 
-        tk.Label(f, text="Laptop IP:", font=("Segoe UI", 10))\
+        tk.Label(f, text="Receiver PC IP:", font=("Segoe UI", 10))\
             .grid(row=0, column=0, sticky="w", **pad)
         self.ip_var = tk.StringVar()
         tk.Entry(f, textvariable=self.ip_var, width=18,
                  font=("Consolas", 12)).grid(row=0, column=1, sticky="w")
-        self.btn_find = tk.Button(f, text="Find my laptop",
+        self.btn_find = tk.Button(f, text="Find receiver PC",
                                   command=self._find)
         self.btn_find.grid(row=0, column=2, padx=12)
 
@@ -309,10 +310,11 @@ class App(tk.Tk):
     # ---------------- test tab
     def _build_test(self):
         tk.Label(self.tab_test, justify="left",
-                 text=("This shows what the Ally's controls are outputting, "
+                 text=("This shows what this device's controls are outputting, "
                        "live - even before you press Start.\n"
-                       "If nothing reacts here, switch the Ally's control "
-                       "mode to Gamepad (Armoury Crate / Command Center).")
+                       "If nothing reacts here, switch the control mode to "
+                       "Gamepad (Armoury Crate / Command Center, or your "
+                       "device's equivalent).")
                  ).pack(anchor="w", padx=10, pady=6)
         self.view = ControllerView(self.tab_test)
         self.view.pack(padx=10, pady=4)
@@ -337,16 +339,16 @@ class App(tk.Tk):
         def work():
             ip = discover_receiver(port)
             def done():
-                self.btn_find.config(state="normal", text="Find my laptop")
+                self.btn_find.config(state="normal", text="Find receiver PC")
                 if ip:
                     self.ip_var.set(ip)
                 else:
                     messagebox.showwarning(
                         APP_NAME,
-                        "Laptop not found.\n\nCheck that:\n"
-                        "1. The Receiver app is OPEN on the laptop\n"
+                        "Receiver PC not found.\n\nCheck that:\n"
+                        "1. The Receiver app is OPEN on that PC\n"
                         "2. Both devices are on the SAME network\n"
-                        "3. The laptop firewall allowed Python\n\n"
+                        "3. That PC's firewall allowed Python\n\n"
                         "You can also type the IP shown on the "
                         "receiver's Home tab.")
             self.after(0, done)
@@ -358,8 +360,8 @@ class App(tk.Tk):
             ip = self.ip_var.get().strip()
             if not ip:
                 messagebox.showerror(APP_NAME,
-                                     "Enter the laptop IP first, or press "
-                                     "'Find my laptop'.")
+                                     "Enter the receiver PC's IP first, or press "
+                                     "'Find receiver PC'.")
                 return
             try:
                 port = int(self.port_var.get())
