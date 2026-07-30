@@ -7,6 +7,7 @@ Creates a virtual Xbox 360 controller (via the ViGEmBus driver) and
 mirrors whatever the WinPadBridge Sender streams over Bluetooth.
 """
 
+import ctypes
 import json
 import os
 import re
@@ -21,8 +22,8 @@ from tkinter import ttk, messagebox
 
 APP_NAME = "WinPadBridge Receiver  (PC)"
 BT_CHANNELS = (4, 5, 6, 7)          # RFCOMM channels tried in order
-# seq, buttons, LT, RT, LX, LY, RX, RY, touch_flags, touch_x, touch_y
-PACKET_FMT = "<IHBBhhhhBHH"
+# seq, buttons, LT, RT, LX, LY, RX, RY, touch_flags, touch_dx, touch_dy
+PACKET_FMT = "<IHBBhhhhBhh"
 PACKET_SIZE = struct.calcsize(PACKET_FMT)
 HELLO = b"WINPADBRIDGE?"            # handshake: sender -> receiver
 WELCOME = b"WINPADBRIDGE!"          # handshake: receiver -> sender
@@ -33,15 +34,13 @@ BT_PROTO = getattr(socket, "BTPROTO_RFCOMM",
 DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"  # USB-cable discovery: handheld -> PC
 HERE_MSG = b"WINPADBRIDGE_HERE"          # USB-cable discovery: PC -> handheld
 CABLE_PORT = 47845
-TOUCH_W, TOUCH_H = 1920, 943        # DS4 touchpad native resolution
+MOUSE_SENSITIVITY = 3.0             # multiplier applied to touchpad drag deltas
 
 # ---------------------------------------------------------------- vgamepad --
 VG_ERROR = ""
 vg = None
-vc4 = None
 try:
     import vgamepad as vg
-    import vgamepad.win.vigem_commons as vc4
 except Exception as e:
     VG_ERROR = str(e)
 
@@ -65,8 +64,6 @@ class Pad:
         self.type = pad_type
         self.gp = None
         self.error = VG_ERROR
-        self._touch_id = 0
-        self._touch_was_active = False
         if vg is not None:
             self._build_maps()
             self._create()
@@ -116,8 +113,6 @@ class Pad:
             return
         with _pad_lock:
             self.type = pad_type
-            self._touch_id = 0
-            self._touch_was_active = False
             self._create()
 
     def apply(self, fields):
@@ -146,7 +141,10 @@ class Pad:
         self.gp.update()
 
     def _apply_ds4(self, fields):
-        buttons, lt, rt, lx, ly, rx, ry, touch_flags, touch_x, touch_y = fields
+        # Touch fields (index 7-9) aren't part of the DS4 report -- the
+        # touchpad rectangle drives the real mouse cursor instead (see
+        # MouseCtl), independently of pad type.
+        buttons, lt, rt, lx, ly, rx, ry = fields[:7]
         p = self.gp
         p.reset()
         for xinput_bit, ds4_btn in self._BTN_MAP:
@@ -164,41 +162,46 @@ class Pad:
         # DS4's Y axis is inverted relative to XInput's (XInput: up = positive).
         p.left_joystick(_axis_to_u8(lx), _axis_to_u8(-ly))
         p.right_joystick(_axis_to_u8(rx), _axis_to_u8(-ry))
-
-        rep_ex = vc4.DS4_REPORT_EX()
-        sub = rep_ex.Report
-        sub.bThumbLX = p.report.bThumbLX
-        sub.bThumbLY = p.report.bThumbLY
-        sub.bThumbRX = p.report.bThumbRX
-        sub.bThumbRY = p.report.bThumbRY
-        sub.wButtons = p.report.wButtons
-        sub.bSpecial = p.report.bSpecial
-        sub.bTriggerL = p.report.bTriggerL
-        sub.bTriggerR = p.report.bTriggerR
-
-        touching = bool(touch_flags & 0x01)
-        click = bool(touch_flags & 0x02)
-        if touching and not self._touch_was_active:
-            self._touch_id = (self._touch_id + 1) & 0x7F
-        self._touch_was_active = touching
-        if click:
-            sub.bSpecial |= vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD
-
-        tx = max(0, min(TOUCH_W - 1, touch_x))
-        ty = max(0, min(TOUCH_H - 1, touch_y))
-        touch = sub.sCurrentTouch
-        touch.bIsUpTrackingNum1 = (0x00 if touching else 0x80) | self._touch_id
-        touch.bTouchData1[0] = tx & 0xFF
-        touch.bTouchData1[1] = ((ty & 0x0F) << 4) | ((tx >> 8) & 0x0F)
-        touch.bTouchData1[2] = (ty >> 4) & 0xFF
-        sub.bTouchPacketsN = 1
-        sub.sPreviousTouch[0].bIsUpTrackingNum1 = 0x80
-        sub.sPreviousTouch[1].bIsUpTrackingNum1 = 0x80
-
-        p.update_extended_report(rep_ex)
+        p.update()
 
 
 PAD = Pad("xbox360")
+
+
+class MouseCtl:
+    """Moves this PC's real mouse cursor from touchpad drag deltas, and
+    clicks the left button. Independent of the virtual gamepad/pad type --
+    a plain Windows cursor move, like a laptop trackpad."""
+
+    MOVE = 0x0001
+    LEFTDOWN = 0x0002
+    LEFTUP = 0x0004
+
+    def __init__(self):
+        self._user32 = ctypes.windll.user32
+        self._clicked = False
+        self.last_dx = 0
+        self.last_dy = 0
+        self.touching = False
+
+    def apply(self, touch_flags, dx, dy):
+        touching = bool(touch_flags & 0x01)
+        click = bool(touch_flags & 0x02)
+        self.touching = touching
+        self.last_dx, self.last_dy = dx, dy
+        if touching and (dx or dy):
+            mx = round(dx * MOUSE_SENSITIVITY)
+            my = round(dy * MOUSE_SENSITIVITY)
+            if mx or my:
+                self._user32.mouse_event(self.MOVE, mx, my, 0, 0)
+        if click and not self._clicked:
+            self._user32.mouse_event(self.LEFTDOWN, 0, 0, 0, 0)
+        elif not click and self._clicked:
+            self._user32.mouse_event(self.LEFTUP, 0, 0, 0, 0)
+        self._clicked = click
+
+
+MOUSE = MouseCtl()
 
 
 def local_bt_mac():
@@ -323,6 +326,7 @@ class BtServer:
                 except socket.timeout:
                     if time.monotonic() - last_data > 0.8:
                         PAD.neutral()               # stalled link safety
+                        MOUSE.apply(0, 0, 0)
                 except OSError:
                     break
                 else:
@@ -337,6 +341,7 @@ class BtServer:
                         _seq, *fields = struct.unpack(PACKET_FMT, pkt)
                         self.latest = tuple(fields)
                         PAD.apply(self.latest)
+                        MOUSE.apply(*self.latest[7:10])
                         count += 1
 
                 now = time.monotonic()
@@ -352,6 +357,7 @@ class BtServer:
             self.link_active = False
             self.latest = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             PAD.neutral()
+            MOUSE.apply(0, 0, 0)
             self._log("Sender disconnected")
             self.status = (f"Listening on channel {self.channel} - waiting "
                            "for the sender...")
@@ -396,6 +402,7 @@ class CableServer:
                     self.link_active = False
                     self.latest = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
                     PAD.neutral()
+                    MOUSE.apply(0, 0, 0)
                 data = None
             except OSError:
                 break
@@ -425,9 +432,11 @@ class CableServer:
             self.link_active = True
             self.status = f"USB cable: CONNECTED ({addr[0]})"
             PAD.apply(self.latest)
+            MOUSE.apply(*self.latest[7:10])
 
         sock.close()
         PAD.neutral()
+        MOUSE.apply(0, 0, 0)
 
 
 # --------------------------------------------------------- controller view --
@@ -515,6 +524,43 @@ class ControllerView(tk.Canvas):
         self.itemconfig(self.i["msg"], text=msg)
 
 
+class TouchMonitor(tk.Canvas):
+    """Visual proof that touchpad packets are arriving: a dot that walks
+    around this box by the same drag deltas being sent to the real mouse
+    cursor. Doesn't reflect actual cursor position -- it's a diagnostic,
+    not a mirror of the screen."""
+
+    W, H = 300, 160
+
+    def __init__(self, master):
+        super().__init__(master, width=self.W, height=self.H,
+                         bg="#15161a", highlightthickness=0)
+        self.x = self.W / 2
+        self.y = self.H / 2
+        self.dot = self.create_oval(0, 0, 0, 0, fill="#666", outline="")
+        self.txt = self.create_text(self.W / 2, self.H - 14, fill="#999",
+                                    font=("Consolas", 9), text="")
+        self._place()
+
+    def _place(self):
+        r = 10
+        self.coords(self.dot, self.x - r, self.y - r, self.x + r, self.y + r)
+
+    def show(self, touching, click, dx, dy):
+        if touching:
+            self.x = max(10, min(self.W - 10, self.x + dx))
+            self.y = max(10, min(self.H - 10, self.y + dy))
+            fill = "#ffb02e" if click else "#43d167"
+        else:
+            fill = "#666"
+        self._place()
+        self.itemconfig(self.dot, fill=fill)
+        state = "touching" if touching else "idle"
+        if click:
+            state += " + click"
+        self.itemconfig(self.txt, text=f"{state}   dx {dx:>3} dy {dy:>3}")
+
+
 # -------------------------------------------------------------------- app ---
 HELP_TEXT = """SIMPLE STEPS
 
@@ -555,12 +601,21 @@ extra setup needed here, this app listens for it
 automatically. On the handheld, choose "USB cable" instead
 of Bluetooth and press START.
 
-TOUCHPAD (DS4 MODE)
-Switch "Pad type" to DS4 (Main tab, top) to get a touchpad
-in addition to the normal buttons/sticks - the sender shows
-a drag area plus a click button. Some games only recognize
-Xbox controllers and won't see a DS4 pad at all, so leave
-it on Xbox 360 unless you specifically need the touchpad."""
+TOUCHPAD
+The sender has a drag area plus a click button. Dragging it
+moves this PC's real mouse cursor directly (like a laptop
+trackpad) - it works no matter which Pad type is selected,
+since it doesn't go through the virtual controller at all.
+The "Touchpad monitor" box on the Main tab shows a dot so
+you can confirm packets are arriving even with no mouse
+movement in view.
+
+PAD TYPE (Xbox 360 / DS4)
+This only affects buttons/sticks/triggers. Xbox 360 is the
+default (broadest game compatibility). DS4 makes this PC's
+virtual controller show up as a DualShock 4 instead - some
+PlayStation-native ports expect that, but some Xbox-only
+games won't recognize it, so only switch if you need it."""
 
 
 class App(tk.Tk):
@@ -599,13 +654,14 @@ class App(tk.Tk):
         prow.pack(anchor="w", padx=12, pady=(0, 6))
         tk.Label(prow, text="Pad type:").pack(side="left")
         self.pad_type = tk.StringVar(value="xbox360")
-        for val, label in (("xbox360", "Xbox 360"), ("ds4", "DS4 (touchpad)")):
+        for val, label in (("xbox360", "Xbox 360"), ("ds4", "DS4")):
             tk.Radiobutton(prow, text=label, variable=self.pad_type, value=val,
                           command=self._on_pad_type_change)\
                 .pack(side="left", padx=(8, 0))
         tk.Label(prow, fg="#888",
-                 text="  (DS4 adds the touchpad; some Xbox-only games won't "
-                      "recognize it)").pack(side="left")
+                 text="  (buttons/sticks only; some Xbox-only games won't "
+                      "recognize a DS4 pad. Touchpad works either way.)")\
+            .pack(side="left")
 
         self.lbl_btid = tk.Label(f, font=("Consolas", 10), fg="#555")
         self.lbl_btid.pack(anchor="w", padx=12)
@@ -631,8 +687,11 @@ class App(tk.Tk):
         self.view = ControllerView(f)
         self.view.pack(padx=12, pady=6)
 
-        self.lbl_touch = tk.Label(f, font=("Consolas", 10), fg="#777")
-        self.lbl_touch.pack(anchor="w", padx=12)
+        tk.Label(f, fg="#9aa0a6",
+                 text="Touchpad monitor (moves this PC's real mouse "
+                      "cursor too):").pack(anchor="w", padx=12, pady=(4, 0))
+        self.touch_mon = TouchMonitor(f)
+        self.touch_mon.pack(padx=12, pady=(2, 6))
 
         tk.Label(f, fg="#666", justify="left",
                  text="While this window is open, games see a normal "
@@ -714,16 +773,9 @@ class App(tk.Tk):
             full, msg = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0), "no data arriving"
         self.view.show(full[:7], msg)
 
-        if PAD.type == "ds4":
-            touch_flags, touch_x, touch_y = full[7:10]
-            if touch_flags & 0x01:
-                click = "  CLICK" if touch_flags & 0x02 else ""
-                self.lbl_touch.config(text=f"Touch: {touch_x:>4},{touch_y:>3}"
-                                            f"{click}")
-            else:
-                self.lbl_touch.config(text="Touch: (not touching)")
-        else:
-            self.lbl_touch.config(text="")
+        touch_flags, dx, dy = full[7:10]
+        self.touch_mon.show(bool(touch_flags & 0x01), bool(touch_flags & 0x02),
+                            dx, dy)
         self.after(33, self._tick)
 
     def _close(self):

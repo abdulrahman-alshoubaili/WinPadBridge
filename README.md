@@ -68,25 +68,26 @@ natively act as a Bluetooth gamepad peripheral.
 Both apps include a live controller-test view and step-by-step help
 built into the UI, so most setup issues are diagnosed on-screen.
 
-## Touchpad (DS4 mode)
+## Touchpad (mouse control)
 
-The receiver can emulate a **DS4 (PlayStation 4) controller** instead of
-an Xbox 360 pad. DS4 mode adds a touchpad — the sender shows a drag
-rectangle (mirrors the real DS4/DS5 touchpad's 1920x943 coordinate
-space) plus a separate click button, matching how a real touchpad
-reports finger position and physical click as distinct signals.
+The sender has a drag rectangle plus a click button. Dragging it moves
+the receiver PC's **real Windows mouse cursor** directly — like a
+laptop trackpad — completely independent of the virtual gamepad. It
+works no matter which Pad type is selected below, since it's a plain
+cursor move/click, not part of the controller's HID report.
 
-This is opt-in and off by default: switch "Pad type" to **DS4** on the
-receiver's Main tab. Xbox 360 stays the default because some games only
-recognize Xbox-style controllers and won't see a DS4 pad at all — only
-switch to DS4 if you specifically need the touchpad (e.g. a PS-native
-port that uses it for a cursor or gestures). Buttons, sticks, and
-triggers work the same in both modes; only the touchpad requires DS4.
+The receiver's Main tab has a "Touchpad monitor" box: a dot that walks
+around by the same drag deltas being sent to the cursor, so you can
+confirm packets are arriving even when you can't see the real cursor
+(e.g. it's off in a game window).
 
-Note: the touchpad implementation talks directly to ViGEmBus's extended
-DS4 report format and hasn't been validated against a wide range of
-real games — button/stick/dpad mapping has been verified in isolation,
-but touch behavior in-game may need tuning.
+## Pad type (Xbox 360 / DS4)
+
+The receiver can emulate either an **Xbox 360** controller (default,
+broadest game compatibility) or a **DS4** (DualShock 4) controller.
+This only affects buttons/sticks/triggers — some games only recognize
+Xbox-style input and won't see a DS4 pad at all, so only switch to DS4
+if a game specifically expects a PlayStation-style controller.
 
 ## Project background
 

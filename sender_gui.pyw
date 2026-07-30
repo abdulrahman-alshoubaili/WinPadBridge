@@ -23,14 +23,13 @@ from tkinter import ttk, messagebox
 
 APP_NAME = "WinPadBridge Sender"
 BT_CHANNELS = (4, 5, 6, 7)              # RFCOMM channels tried in order
-# seq, buttons, LT, RT, LX, LY, RX, RY, touch_flags, touch_x, touch_y
-PACKET_FMT = "<IHBBhhhhBHH"
+# seq, buttons, LT, RT, LX, LY, RX, RY, touch_flags, touch_dx, touch_dy
+PACKET_FMT = "<IHBBhhhhBhh"
 HELLO = b"WINPADBRIDGE?"                # handshake: sender -> receiver
 WELCOME = b"WINPADBRIDGE!"              # handshake: receiver -> sender
 DISCOVER_MSG = b"WINPADBRIDGE_DISCOVER"  # USB-cable discovery: sender -> PC
 HERE_MSG = b"WINPADBRIDGE_HERE"          # USB-cable discovery: PC -> sender
 CABLE_PORT = 47845
-TOUCH_W, TOUCH_H = 1920, 943            # DS4 touchpad native resolution
 
 
 def discover_over_cable(timeout=2.5):
@@ -152,21 +151,32 @@ class PadEngine:
         self.latest = (0, 0, 0, 0, 0, 0, 0)
         self.error = ""
         self.changed = threading.Event()
-        # touchpad state, driven by the UI thread (see TouchPad widget)
+        # touchpad state, driven by the UI thread (see TouchPad widget).
+        # dx/dy accumulate drag movement since the last time a streamer
+        # thread packed and sent it (see take_touch_delta).
         self.touch_active = False
-        self.touch_x = 0
-        self.touch_y = 0
+        self.touch_dx = 0
+        self.touch_dy = 0
         self.touch_click = False
         threading.Thread(target=self.run, daemon=True).start()
 
     def stop(self):
         self.stop_ev.set()
 
-    def set_touch(self, active, x, y):
+    def set_touch(self, active):
         self.touch_active = active
-        self.touch_x = x
-        self.touch_y = y
         self.changed.set()
+
+    def add_touch_delta(self, dx, dy):
+        self.touch_dx += dx
+        self.touch_dy += dy
+        self.changed.set()
+
+    def take_touch_delta(self):
+        dx, dy = self.touch_dx, self.touch_dy
+        self.touch_dx = 0
+        self.touch_dy = 0
+        return dx, dy
 
     def set_touch_click(self, click):
         self.touch_click = click
@@ -323,9 +333,9 @@ class BtStreamer(threading.Thread):
                     last_sent = now
                     seq = (seq + 1) & 0xFFFFFFFF
                     e = self.engine
+                    dx, dy = e.take_touch_delta()
                     sock.sendall(struct.pack(PACKET_FMT, seq, *e.latest,
-                                             e.touch_flags, e.touch_x,
-                                             e.touch_y))
+                                             e.touch_flags, dx, dy))
                     count += 1
                     if now - t0 >= 1.0:
                         self.pps = count
@@ -381,10 +391,10 @@ class CableStreamer(threading.Thread):
                 last_sent = now
                 seq = (seq + 1) & 0xFFFFFFFF
                 e = self.engine
+                dx, dy = e.take_touch_delta()
                 try:
                     sock.sendto(struct.pack(PACKET_FMT, seq, *e.latest,
-                                            e.touch_flags, e.touch_x,
-                                            e.touch_y),
+                                            e.touch_flags, dx, dy),
                                (self.ip, CABLE_PORT))
                 except OSError as e:
                     self.status = f"USB cable send failed: {e}"
@@ -485,40 +495,55 @@ class ControllerView(tk.Canvas):
 
 
 class TouchPad(tk.Canvas):
-    """A drag rectangle that mirrors a DS4/DS5 touchpad's coordinate space
-    (1920x943). Only has an effect when the receiver is set to DS4 mode --
-    in Xbox 360 mode the receiver just ignores this data."""
+    """A drag rectangle that works like a laptop trackpad: dragging sends
+    relative motion deltas that move the receiver PC's real mouse cursor.
+    The dot only shows where you're currently touching on THIS rectangle,
+    not where the remote cursor ends up."""
 
-    DISPLAY_W, DISPLAY_H = 460, 226   # keeps the real touchpad's aspect ratio
+    W, H = 460, 226
 
     def __init__(self, master, engine):
-        super().__init__(master, width=self.DISPLAY_W, height=self.DISPLAY_H,
+        super().__init__(master, width=self.W, height=self.H,
                          bg="#1b1d22", highlightthickness=2,
                          highlightbackground="#444")
         self.engine = engine
-        self.hint = self.create_text(self.DISPLAY_W / 2, self.DISPLAY_H / 2,
+        self._last = None
+        self.hint = self.create_text(self.W / 2, self.H / 2,
                                      text="touchpad - drag here", fill="#555",
                                      font=("Segoe UI", 11))
         self.dot = self.create_oval(0, 0, 0, 0, fill="", outline="")
-        self.bind("<ButtonPress-1>", self._touch)
-        self.bind("<B1-Motion>", self._touch)
-        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<ButtonPress-1>", self._down)
+        self.bind("<B1-Motion>", self._move)
+        self.bind("<ButtonRelease-1>", self._up)
 
-    def _touch(self, ev):
-        x = max(0, min(self.DISPLAY_W, ev.x))
-        y = max(0, min(self.DISPLAY_H, ev.y))
-        tx = round(x / self.DISPLAY_W * (TOUCH_W - 1))
-        ty = round(y / self.DISPLAY_H * (TOUCH_H - 1))
-        self.engine.set_touch(True, tx, ty)
+    def _down(self, ev):
+        self._last = (ev.x, ev.y)
+        self.engine.set_touch(True)
+        self._draw(ev.x, ev.y)
+        self.itemconfig(self.hint, text="")
+
+    def _move(self, ev):
+        if self._last is None:
+            self._last = (ev.x, ev.y)
+            return
+        dx = ev.x - self._last[0]
+        dy = ev.y - self._last[1]
+        self._last = (ev.x, ev.y)
+        self.engine.add_touch_delta(dx, dy)
+        self._draw(ev.x, ev.y)
+
+    def _up(self, _ev):
+        self._last = None
+        self.engine.set_touch(False)
+        self.itemconfig(self.dot, fill="", outline="")
+        self.itemconfig(self.hint, text="touchpad - drag here")
+
+    def _draw(self, x, y):
+        x = max(0, min(self.W, x))
+        y = max(0, min(self.H, y))
         r = 9
         self.coords(self.dot, x - r, y - r, x + r, y + r)
         self.itemconfig(self.dot, fill="#43d167", outline="#2e7d32")
-        self.itemconfig(self.hint, text="")
-
-    def _release(self, _ev):
-        self.engine.set_touch(False, self.engine.touch_x, self.engine.touch_y)
-        self.itemconfig(self.dot, fill="", outline="")
-        self.itemconfig(self.hint, text="touchpad - drag here")
 
 
 # -------------------------------------------------------------------- app ---
@@ -615,8 +640,8 @@ class App(tk.Tk):
         self.view.pack(pady=6)
 
         tk.Label(body, bg=BG, fg="#9aa0a6", font=("Segoe UI", 11),
-                 text="Touchpad (only used when the receiver is set to "
-                      "DS4 mode):").pack(pady=(6, 2))
+                 text="Touchpad (drag to move the receiver PC's mouse "
+                      "cursor):").pack(pady=(6, 2))
         pad_row = tk.Frame(body, bg=BG)
         pad_row.pack(pady=(0, 6))
         self.touchpad = TouchPad(pad_row, self.engine)
